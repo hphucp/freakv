@@ -1,0 +1,26 @@
+# Build artifacts
+.build/
+freakv
+
+# Editor / OS files
+*.swp
+*~
+.DS_Store
+
+# Temporary snapshot / test files
+/tmp/freakv_snap_*/
+*.snap
+*.fsnap
+*.tmp
+fixtures/
+
+
+# Profiling / Logs
+*.log
+gmon.out
+perf.data
+perf.data.old
+
+# Tooling
+.vscode/
+.idea/

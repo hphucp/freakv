@@ -1,0 +1,129 @@
+#ifndef MESSAGE_H
+#define MESSAGE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct resp_cmd {
+  uint32_t argc;
+  char **argv;    /* dynamically allocated */
+  size_t *arglen; /* dynamically allocated */
+};
+
+/*
+ * spsc_message op (16-bit):
+ * [High 4 bits]: System Op (MSG_SYS_*)
+ * [Low 12 bits]: Command ID (MSG_CMD_*)
+ */
+
+#define MSG_SYS_SHIFT 12
+#define MSG_SYS_MASK (0xF << MSG_SYS_SHIFT)
+#define MSG_CMD_MASK 0x0FFF
+
+#define MSG_PACK_OP(sys, cmd)                                                  \
+  (((sys) << MSG_SYS_SHIFT) | ((cmd) & MSG_CMD_MASK))
+#define MSG_GET_SYS(op) (((op) & MSG_SYS_MASK) >> MSG_SYS_SHIFT)
+#define MSG_GET_CMD(op) ((op) & MSG_CMD_MASK)
+
+/* System Opcodes (High 4 bits) */
+enum spsc_sys_op {
+  MSG_SYS_REQ = 0x1,
+  MSG_SYS_REPLY = 0x2,
+  MSG_SYS_RELEASE = 0x3,
+};
+
+/* Command / Sub-Opcodes (Low 12 bits) */
+enum resp_cmd_id {
+  MSG_CMD_GET = 1,
+  MSG_CMD_SET = 2,
+  MSG_CMD_DEL = 3,
+  MSG_CMD_EXISTS = 4,
+  MSG_CMD_TTL = 5,
+  MSG_CMD_PTTL = 6,
+  MSG_CMD_TYPE = 7,
+  MSG_CMD_INCR = 8,
+  MSG_CMD_STRLEN = 9,
+  MSG_CMD_DBSIZE = 10, // Added MSG_CMD_DBSIZE
+
+  MSG_CMD_EXPIRE = 11,    // Shifted to avoid conflict with MSG_CMD_DBSIZE
+  MSG_CMD_PEXPIRE = 12,   // Shifted
+  MSG_CMD_PERSIST = 13,   // Shifted
+  MSG_CMD_EXPIREAT = 14,  // Shifted
+  MSG_CMD_PEXPIREAT = 15, // Shifted
+
+  /* Internal split ops for MGET/MSET/DEL */
+  MSG_CMD_MGET_PART = 100,
+  MSG_CMD_MSET_PART = 101,
+  MSG_CMD_SET_NX = 102,
+  MSG_CMD_SET_XX = 103,
+  MSG_CMD_DEL_PART = 104,
+
+  /* Atomic MSET 2-phase commit protocol */
+  MSG_CMD_MSET_PREPARE = 200,  /* coordinator → participant: tentative SET  */
+  MSG_CMD_MSET_DONE = 201,     /* participant → coordinator: prepare OK     */
+  MSG_CMD_MSET_FAIL = 202,     /* participant → coordinator: prepare failed */
+  MSG_CMD_MSET_FIN = 203,      /* coordinator → participant: commit         */
+  MSG_CMD_MSET_ROLLBACK = 204, /* coordinator → participant: abort          */
+  MSG_CMD_MSET_ROLLBACK_ACK = 205, /* participant → coordinator: abort done */
+};
+
+/*
+ * Batch descriptor for atomic MSET PREPARE.
+ * Allocated by coordinator, pointed to by spsc_message.key_ptr.
+ * Contains all key-value pairs destined for one participant shard.
+ */
+struct mset_batch_entry {
+  const char *key;
+  size_t klen;
+  const char *val;
+  size_t vlen;
+};
+
+struct mset_batch {
+  uint32_t count;                   /* number of entries                  */
+  struct mset_batch_entry *entries; /* array of key-value pairs           */
+  void **old_objs;                  /* filled by participant: old kv_obj* */
+};
+
+enum msg_reply_type {
+  REPLY_TYPE_NONE = 0,
+  REPLY_TYPE_OK = 1,
+  REPLY_TYPE_NIL = 2,
+  REPLY_TYPE_INT = 3,
+  REPLY_TYPE_ERR = 4,
+  REPLY_TYPE_BUF = 5,
+  REPLY_TYPE_PONG = 6,
+  REPLY_TYPE_KV_OBJ = 7,
+  REPLY_TYPE_BUF_STATIC = 8,
+};
+
+struct spsc_message {
+  uint16_t op;         /* Packed system op + command id            */
+  uint8_t shard_owner; /* Shard that originated the message        */
+  uint8_t _pad0;
+  struct resp_cmd cmd; /* Parsed command (passed by value)         */
+  /* Routing/Extraction fields for split commands */
+  void *key_ptr;
+  uint32_t key_len;
+  uint32_t val_len;
+  void *val_ptr;
+
+  /* Batch/Context information */
+  uint32_t pipeline_idx; /* Sequence number in proxy pipeline        */
+  uint32_t sub_idx;      /* Index within multi-key command           */
+  void *conn_ptr;
+  uint64_t conn_generation;
+  struct net_buf *req_nb; /* input buffer refcount */
+
+  /* Reply information */
+  void *kv_obj_ptr;  /* Ref'd object for zero-copy reply         */
+  void *old_obj_ptr; /* Previous object for atomic MSET rollback */
+  void *reply_buf;   /* RESP binary reply                        */
+  uint32_t reply_len;
+  uint8_t reply_type; /* enum msg_reply_type */
+  uint8_t _pad1;
+  uint16_t _pad2;
+  int64_t reply_int; /* For INT replies */
+};
+
+#endif /* MESSAGE_H */
