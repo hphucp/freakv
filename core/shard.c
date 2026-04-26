@@ -58,8 +58,6 @@ static inline void lru_node_touch(struct shard *s, struct kv_obj *o) {
 /* ── Constants ────────────────────────────────────────────────────────── */
 
 #define INITIAL_BUCKETS 8192
-#define SPSC_CAPACITY 65536
-
 /* ── CPU helpers ──────────────────────────────────────────────────────── */
 
 uint32_t num_cpu_count(void) {
@@ -1111,7 +1109,7 @@ struct shard_engine *shard_engine_create(struct slab_allocator *init_pool,
       if (s == r)
         continue;
       struct spsc_queue *q = &e->queues[s * num_shards + r];
-      if (!spsc_queue_init(q, SPSC_CAPACITY))
+      if (!spsc_queue_init(q, e->shards[s].pool))
         return NULL;
       e->shards[r].inboxes[s] = q;
     }
