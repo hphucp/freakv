@@ -4,6 +4,7 @@
 #include "resp.h"
 
 #include "../core/message.h"
+#include "../core/mset_exec.h"
 #include "../core/routing.h"
 #include "../core/shard.h"
 #include "../memory/slab.h"
@@ -457,7 +458,8 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                              .conn_ptr = c,
                              .conn_generation = c->generation,
                              .pipeline_idx = pipeline_seq,
-                             .req_nb = c->rbuf_nb};
+                             .req_nb = c->rbuf_nb,
+                             .sent_cycles = cycles_now()};
   if (msg.req_nb)
     net_buf_ref(msg.req_nb);
   /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
@@ -469,6 +471,94 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
   r->shard->cross_shard_sent++;
   r->proxy_wake_mask |= (1U << target_shard);
   return true;
+}
+
+static bool resp_mixed_profile_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MSET_MIXED_PROFILE");
+    cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+  }
+  return cached != 0;
+}
+
+static uint64_t resp_mixed_profile_slow_cycles(void) {
+  static uint64_t cached = 0;
+  if (!cached) {
+    const char *v = getenv("MSET_MIXED_SLOW_US");
+    uint64_t us = v && v[0] ? strtoull(v, NULL, 10) : 1000;
+    if (!us)
+      us = 1000;
+    cached = us * 3000ULL;
+  }
+  return cached;
+}
+
+static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
+                                uint16_t cmd_op, uint32_t pipeline_seq,
+                                struct resp_parser *p,
+                                struct net_pipeline_slot *s,
+                                uint64_t now) {
+  s->state = PSLOT_PENDING;
+  s->shard_owner = r->shard->id;
+  s->cmd.argc = (uint32_t)p->argc_got;
+  s->cmd.argv =
+      (char **)slab_obj_alloc(r->shard->pool, s->cmd.argc * sizeof(char *));
+  s->cmd.arglen =
+      (size_t *)slab_obj_alloc(r->shard->pool, s->cmd.argc * sizeof(size_t));
+  if (!s->cmd.argv || !s->cmd.arglen) {
+    if (s->cmd.argv)
+      slab_obj_free(r->shard->pool, s->cmd.argv);
+    if (s->cmd.arglen)
+      slab_obj_free(r->shard->pool, s->cmd.arglen);
+    s->cmd.argv = NULL;
+    s->cmd.arglen = NULL;
+    resp_reply_err(r, c, "OOM");
+    return 0;
+  }
+  for (uint32_t i = 0; i < s->cmd.argc; i++) {
+    s->cmd.argv[i] = p->argv[i];
+    s->cmd.arglen[i] = p->arglen[i];
+  }
+
+  if (!s->req_nb) {
+    net_buf_ref(c->rbuf_nb);
+    s->req_nb = c->rbuf_nb;
+  }
+
+  struct spsc_message msg = {
+      .op = MSG_PACK_OP(MSG_SYS_REQ, cmd_op),
+      .shard_owner = (uint8_t)r->shard->id,
+      .cmd = s->cmd,
+      .conn_ptr = c,
+      .conn_generation = c->generation,
+      .pipeline_idx = pipeline_seq,
+      .req_nb = c->rbuf_nb,
+  };
+  bool prof = resp_mixed_profile_enabled();
+  uint64_t t_exec = prof ? cycles_now() : 0;
+  enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
+  if (prof) {
+    uint64_t dur = cycles_now() - t_exec;
+    if (dur >= resp_mixed_profile_slow_cycles() ||
+        exec_rc == PROXY_EXEC_DEFERRED) {
+      fprintf(stderr,
+              "[MSET_MIXED_LOCAL] shard=%u cmd=%u pidx=%u durcy=%lu "
+              "deferred=%d\n",
+              r->shard->id, cmd_op, pipeline_seq, (unsigned long)dur,
+              exec_rc == PROXY_EXEC_DEFERRED);
+    }
+  }
+  if (exec_rc == PROXY_EXEC_DEFERRED)
+    return 1;
+
+  s->reply_type = msg.reply_type;
+  s->reply_int = msg.reply_int;
+  s->reply_data = (uint8_t *)msg.reply_buf;
+  s->reply_len = msg.reply_len;
+  s->kv_obj_ptr = msg.kv_obj_ptr;
+  s->state = PSLOT_DONE;
+  return 2;
 }
 
 static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
@@ -493,6 +583,10 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
     uint32_t owner =
         shard_for_key(p->argv[1], p->arglen[1], r->engine->num_shards);
     if (owner == r->shard->id) {
+      if (ht_bucket_is_locked(r->shard->table, p->argv[1], p->arglen[1],
+                              VAL_TYPE_STRING)) {
+        return proxy_exec_local_key(r, c, MSG_CMD_GET, pipeline_seq, p, s, now);
+      }
       resp_dispatch(r, c, s);
       return 0;
     }
@@ -530,6 +624,21 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
     uint32_t owner =
         shard_for_key(p->argv[1], p->arglen[1], r->engine->num_shards);
     if (owner == r->shard->id) {
+      if (ht_bucket_is_locked(r->shard->table, p->argv[1], p->arglen[1],
+                              VAL_TYPE_STRING)) {
+        uint16_t cmd_op = MSG_CMD_SET;
+        for (int i = 3; i < p->argc_got; i++) {
+          char opt0 =
+              p->arglen[i] > 0 ? (char)toupper((unsigned char)p->argv[i][0]) : 0;
+          char opt1 =
+              p->arglen[i] > 1 ? (char)toupper((unsigned char)p->argv[i][1]) : 0;
+          if (p->arglen[i] == 2 && opt0 == 'N' && opt1 == 'X')
+            cmd_op = MSG_CMD_SET_NX;
+          else if (p->arglen[i] == 2 && opt0 == 'X' && opt1 == 'X')
+            cmd_op = MSG_CMD_SET_XX;
+        }
+        return proxy_exec_local_key(r, c, cmd_op, pipeline_seq, p, s, now);
+      }
       resp_dispatch(r, c, s);
       return 0;
     }
@@ -625,7 +734,8 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                                  .conn_ptr = c,
                                  .conn_generation = c->generation,
                                  .pipeline_idx = pipeline_seq,
-                                 .sub_idx = i};
+                                 .sub_idx = i,
+                                 .sent_cycles = cycles_now()};
       /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
        * and rarely fills under normal load. If the target shard stalls
        * (eviction, snapshot I/O), this busy-wait will add latency to this
@@ -649,7 +759,9 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       shard_for_key(p->argv[1], p->arglen[1], r->engine->num_shards);
 
   if (owner == r->shard->id && strcmp(cmd, "MGET") != 0 &&
-      strcmp(cmd, "MSET") != 0 && strcmp(cmd, "DEL") != 0) {
+      strcmp(cmd, "MSET") != 0 && strcmp(cmd, "DEL") != 0 &&
+      !ht_bucket_is_locked(r->shard->table, p->argv[1], p->arglen[1],
+                           VAL_TYPE_STRING)) {
     resp_dispatch(r, c, s);
     return 0;
   }
@@ -759,15 +871,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       s->reply_len = (uint32_t)hl;
     }
 
-    /* ── Phase 0: Acquire global mset_lock for snapshot isolation ── */
-    for (;;) {
-      uint32_t expected = UINT32_MAX;
-      if (atomic_compare_exchange_weak(&engine->mset_lock, &expected, my_id))
-        break;
-      shard_msg_drain(engine, r->shard, net_reactor_proxy_reply_callback, r);
-      sched_yield();
-    }
-
     /* ── Phase 1: Send MGET_PART to each remote shard ───────────── */
     uint32_t remote_count = 0;
     uint32_t remote_wake_mask = 0;
@@ -778,20 +881,27 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       uint32_t kowner = shard_for_key(pk, pkl, nshards);
 
       if (kowner == my_id) {
-        /* Local fast-path */
-        struct kv_obj *v = shard_key_get(r->shard, pk, pkl, now);
-        if (v) {
-          shard_obj_ref(v);
-          s->multi_kv_objs[i] = v;
-          s->multi_owners[i] = (uint8_t)my_id;
-        } else {
-          s->multi_replies[i] = (uint8_t *)slab_obj_alloc(r->shard->pool, 5);
-          if (s->multi_replies[i])
-            memcpy(s->multi_replies[i], "$-1\r\n", 5);
-          s->multi_reply_lens[i] = 5;
-          s->multi_owners[i] = (uint8_t)my_id;
+        struct spsc_message msg = {
+            .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MGET_PART),
+            .shard_owner = (uint8_t)my_id,
+            .conn_ptr = c,
+            .conn_generation = c->generation,
+            .pipeline_idx = pipeline_seq,
+            .sub_idx = i,
+            .req_nb = c->rbuf_nb,
+            .key_ptr = (void *)pk,
+            .key_len = (uint32_t)pkl,
+            .sent_cycles = cycles_now()};
+        enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
+        if (exec_rc == PROXY_EXEC_DONE) {
+          s->multi_replies[i] = (uint8_t *)msg.reply_buf;
+          s->multi_reply_lens[i] = msg.reply_len;
+          if (s->multi_kv_objs)
+            s->multi_kv_objs[i] = msg.kv_obj_ptr;
+          if (s->multi_owners)
+            s->multi_owners[i] = (uint8_t)my_id;
+          s->multi_replied++;
         }
-        s->multi_replied++;
       } else {
         struct spsc_queue *q = &engine->queues[my_id * nshards + kowner];
         struct spsc_message msg = {
@@ -803,7 +913,8 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             .sub_idx = i,
             .req_nb = c->rbuf_nb,
             .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl};
+            .key_len = (uint32_t)pkl,
+            .sent_cycles = cycles_now()};
         if (msg.req_nb)
           net_buf_ref(msg.req_nb);
         spsc_queue_push(q, &msg);
@@ -879,8 +990,13 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           /* Normal REQ during lock hold — process it */
           if (sys_op == MSG_SYS_REQ) {
             uint64_t cur = net_time_ms_get();
-            proxy_exec(r->shard, &msg, cur);
+            enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, cur);
             r->shard->cross_shard_received++;
+            if (exec_rc == PROXY_EXEC_DEFERRED) {
+              if (msg.req_nb)
+                net_buf_unref(r->shard->pool, msg.req_nb);
+              continue;
+            }
             r->shard->ops_completed++;
 
             struct spsc_queue *rq =
@@ -913,12 +1029,9 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         sched_yield();
     }
 
-    /* ── Phase 3: Release global lock ──────────────────────────── */
-    atomic_store(&engine->mset_lock, UINT32_MAX);
-
-    /* All replies collected synchronously — mark slot complete */
-    s->state = PSLOT_LOCAL;
-    return 0; /* PSLOT_LOCAL — all data already in slot */
+    if (s->multi_replied >= s->multi_parts)
+      s->state = PSLOT_DONE;
+    return 1;
   }
 
   if (strcmp(cmd, "MSET") == 0) {
@@ -926,366 +1039,36 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       resp_reply_err(r, c, "wrong args for MSET");
       return 0;
     }
-    uint32_t npairs = (uint32_t)(p->argc_got - 1) / 2;
-    uint32_t my_id = r->shard->id;
-    uint32_t nshards = r->engine->num_shards;
-    struct shard_engine *engine = r->engine;
 
-    /* ── Phase 0: Acquire global MSET lock ──────────────────── */
-    for (;;) {
-      uint32_t expected = UINT32_MAX;
-      if (atomic_compare_exchange_weak(&engine->mset_lock, &expected, my_id))
-        break;
-      shard_msg_drain(engine, r->shard, net_reactor_proxy_reply_callback, r);
-      sched_yield();
-    }
+    /* Async MSET 2PC dispatch.
+     *
+     * IMPORTANT ordering:
+     *  1. slot is already zero-initialized by net_pipeline_enqueue (called
+     *     by the caller before resp_dispatch_proxy).
+     *  2. We set kv_obj_ptr = stat AFTER mset_coordinator_dispatch returns,
+     *     so it is never overwritten by the caller's ret==0 path (we return 1).
+     *  3. Return 1 (PSLOT_PENDING) so the caller does NOT overwrite s->state.
+     */
+    s->state = PSLOT_PENDING;
+    net_buf_ref(c->rbuf_nb);
+    s->req_nb = c->rbuf_nb;
 
-    /* ── Group pairs by shard ───────────────────────────────── */
-
-    /* Per-shard batch descriptors (index = shard_id).
-     * batches[my_id] is used for local keys. */
-    struct mset_batch *batches =
-        slab_obj_calloc(r->shard->pool, nshards, sizeof(struct mset_batch));
-    if (!batches) {
-      atomic_store(&engine->mset_lock, UINT32_MAX);
+    int rc = mset_coordinator_dispatch(r, c, p, pipeline_seq);
+    if (rc < 0) {
+      s->state = PSLOT_EMPTY;
+      net_buf_unref(c->allocator, c->rbuf_nb);
+      s->req_nb = NULL;
       resp_reply_err(r, c, "OOM");
       return 0;
     }
 
-    /* First pass: count keys per shard */
-    for (uint32_t i = 0; i < npairs; i++) {
-      const char *pk = p->argv[1 + i * 2];
-      size_t pkl = p->arglen[1 + i * 2];
-      uint32_t sid = shard_for_key(pk, pkl, nshards);
-      batches[sid].count++;
-    }
+    /* BUG-FIX: stat pointer is set inside mset_coordinator_dispatch and
+     * stored via ps->kv_obj_ptr = stat there. But because we return 1,
+     * the caller's "ret==0 → s->state = PSLOT_LOCAL" branch is skipped,
+     * so kv_obj_ptr is NOT overwritten. Verify here for safety. */
+    /* Async MSET dispatched */
 
-    /* Allocate entry/old_objs arrays per shard */
-    bool oom = false;
-    for (uint32_t sid = 0; sid < nshards; sid++) {
-      if (batches[sid].count == 0)
-        continue;
-      batches[sid].entries = slab_obj_calloc(r->shard->pool, batches[sid].count,
-                                             sizeof(struct mset_batch_entry));
-      batches[sid].old_objs =
-          slab_obj_calloc(r->shard->pool, batches[sid].count, sizeof(void *));
-      if (!batches[sid].entries || !batches[sid].old_objs) {
-        oom = true;
-        break;
-      }
-      batches[sid].count = 0; /* reset for second pass fill */
-    }
-
-    if (oom) {
-      for (uint32_t sid = 0; sid < nshards; sid++) {
-        if (batches[sid].entries)
-          slab_obj_free(r->shard->pool, batches[sid].entries);
-        if (batches[sid].old_objs)
-          slab_obj_free(r->shard->pool, batches[sid].old_objs);
-      }
-      slab_obj_free(r->shard->pool, batches);
-      atomic_store(&engine->mset_lock, UINT32_MAX);
-      resp_reply_err(r, c, "OOM");
-      return 0;
-    }
-
-    /* Second pass: fill entries */
-    for (uint32_t i = 0; i < npairs; i++) {
-      const char *pk = p->argv[1 + i * 2];
-      size_t pkl = p->arglen[1 + i * 2];
-      const char *pv = p->argv[2 + i * 2];
-      size_t pvl = p->arglen[2 + i * 2];
-      uint32_t sid = shard_for_key(pk, pkl, nshards);
-      uint32_t idx = batches[sid].count++;
-      batches[sid].entries[idx].key = pk;
-      batches[sid].entries[idx].klen = pkl;
-      batches[sid].entries[idx].val = pv;
-      batches[sid].entries[idx].vlen = pvl;
-    }
-
-    /* ── Phase 1: Send one MSET_PREPARE per remote shard ────── */
-    uint32_t remote_shard_mask = 0;
-    uint32_t remote_shard_count = 0;
-
-    for (uint32_t sid = 0; sid < nshards; sid++) {
-      if (sid == my_id || batches[sid].count == 0)
-        continue;
-
-      struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
-      struct spsc_message msg = {
-          .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_PREPARE),
-          .shard_owner = (uint8_t)my_id,
-          .conn_ptr = c,
-          .conn_generation = c->generation,
-          .pipeline_idx = pipeline_seq,
-          .sub_idx = sid,           /* shard id for reply routing */
-          .key_ptr = &batches[sid], /* batch descriptor */
-          .req_nb = c->rbuf_nb,
-      };
-      if (msg.req_nb)
-        net_buf_ref(msg.req_nb);
-      spsc_queue_push(q, &msg);
-
-      remote_shard_mask |= (1U << sid);
-      remote_shard_count++;
-    }
-
-    /* Wake remote shards */
-    if (remote_shard_mask && engine->wake_fds) {
-      uint32_t mask = remote_shard_mask;
-      uint32_t sid = 0;
-      while (mask) {
-        if ((mask & 1) && engine->wake_fds[sid] >= 0) {
-          uint64_t one = 1;
-          if (write(engine->wake_fds[sid], &one, sizeof(one)) < 0) {
-          }
-        }
-        mask >>= 1;
-        sid++;
-      }
-    }
-
-    /* ── Phase 1b: Wait for one DONE/FAIL per remote shard ─── */
-    uint32_t replies_got = 0;
-    bool any_fail = false;
-    /* Track which shards succeeded (for targeted rollback) */
-    uint32_t done_shard_mask = 0;
-
-    while (replies_got < remote_shard_count) {
-      for (uint32_t sender = 0; sender < nshards; sender++) {
-        if (sender == my_id)
-          continue;
-        struct spsc_queue *q = r->shard->inboxes[sender];
-        if (!q)
-          continue;
-
-        struct spsc_message msg;
-        while (spsc_queue_pop(q, &msg)) {
-          uint8_t sys_op = MSG_GET_SYS(msg.op);
-          uint16_t cmd_id = MSG_GET_CMD(msg.op);
-
-          if (sys_op == MSG_SYS_RELEASE) {
-            if (msg.kv_obj_ptr)
-              shard_obj_unref(r->shard, (struct kv_obj *)msg.kv_obj_ptr);
-            if (msg.reply_buf)
-              slab_obj_free(r->shard->pool, msg.reply_buf);
-            continue;
-          }
-
-          if (sys_op == MSG_SYS_REPLY) {
-            if (cmd_id == MSG_CMD_MSET_DONE) {
-              done_shard_mask |= (1U << msg.shard_owner);
-              replies_got++;
-              if (msg.req_nb)
-                net_buf_unref(r->shard->pool, msg.req_nb);
-              continue;
-            }
-            if (cmd_id == MSG_CMD_MSET_FAIL) {
-              any_fail = true;
-              replies_got++;
-              if (msg.req_nb)
-                net_buf_unref(r->shard->pool, msg.req_nb);
-              continue;
-            }
-            /* Non-MSET reply */
-            net_reactor_proxy_reply_callback(r, &msg);
-            continue;
-          }
-
-          /* Normal REQ during lock hold — process it */
-          if (sys_op == MSG_SYS_REQ) {
-            uint64_t cur = net_time_ms_get();
-            proxy_exec(r->shard, &msg, cur);
-            r->shard->cross_shard_received++;
-            r->shard->ops_completed++;
-
-            struct spsc_queue *rq =
-                &engine->queues[my_id * nshards + msg.shard_owner];
-            struct spsc_message reply = {
-                .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_GET_CMD(msg.op)),
-                .shard_owner = (uint8_t)my_id,
-                .conn_ptr = msg.conn_ptr,
-                .conn_generation = msg.conn_generation,
-                .pipeline_idx = msg.pipeline_idx,
-                .sub_idx = msg.sub_idx,
-                .kv_obj_ptr = msg.kv_obj_ptr,
-                .old_obj_ptr = msg.old_obj_ptr,
-                .reply_buf = msg.reply_buf,
-                .reply_len = msg.reply_len,
-                .reply_type = msg.reply_type,
-                .reply_int = msg.reply_int,
-                .req_nb = msg.req_nb};
-            spsc_queue_push(rq, &reply);
-            if (engine->wake_fds && engine->wake_fds[msg.shard_owner] >= 0) {
-              uint64_t one = 1;
-              if (write(engine->wake_fds[msg.shard_owner], &one, sizeof(one)) <
-                  0) {
-              }
-            }
-          }
-        }
-      }
-      if (replies_got < remote_shard_count)
-        sched_yield();
-    }
-
-    /* ── Phase 1c: Execute local keys (tentative) ──────────── */
-    bool local_fail = false;
-    struct mset_batch *local_batch = &batches[my_id];
-    if (!any_fail && local_batch->count > 0) {
-      uint32_t i;
-      for (i = 0; i < local_batch->count; i++) {
-        struct kv_obj *old = shard_key_set_tentative(
-            r->shard, local_batch->entries[i].key, local_batch->entries[i].klen,
-            local_batch->entries[i].val, local_batch->entries[i].vlen);
-        if (old == (struct kv_obj *)(uintptr_t)-1) {
-          local_fail = true;
-          for (uint32_t j = 0; j < i; j++) {
-            shard_key_set_rollback(r->shard, local_batch->entries[j].key,
-                                   local_batch->entries[j].klen,
-                                   (struct kv_obj *)local_batch->old_objs[j]);
-          }
-          break;
-        }
-        local_batch->old_objs[i] = old;
-      }
-    }
-
-    /* ── Phase 2: Commit or Rollback ────────────────────────── */
-    if (!any_fail && !local_fail) {
-      /* ── COMMIT ─────────────────────────────────────────── */
-
-      /* Send FIN to each remote shard (one message per shard) */
-      for (uint32_t sid = 0; sid < nshards; sid++) {
-        if (sid == my_id || batches[sid].count == 0)
-          continue;
-        struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
-        struct spsc_message fin = {
-            .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_FIN),
-            .shard_owner = (uint8_t)my_id,
-        };
-        spsc_queue_push(q, &fin);
-      }
-
-      /* Wake remote shards */
-      if (remote_shard_mask && engine->wake_fds) {
-        uint32_t mask = remote_shard_mask;
-        uint32_t sid = 0;
-        while (mask) {
-          if ((mask & 1) && engine->wake_fds[sid] >= 0) {
-            uint64_t one = 1;
-            if (write(engine->wake_fds[sid], &one, sizeof(one)) < 0) {
-            }
-          }
-          mask >>= 1;
-          sid++;
-        }
-      }
-
-      /* Commit local keys */
-      if (local_batch->count > 0) {
-        for (uint32_t i = 0; i < local_batch->count; i++)
-          shard_key_set_commit(r->shard,
-                               (struct kv_obj *)local_batch->old_objs[i]);
-      }
-
-      s->state = PSLOT_LOCAL;
-      s->shard_owner = (uint8_t)my_id;
-      s->reply_type = REPLY_TYPE_BUF_STATIC;
-      s->reply_data = (uint8_t *)"+OK\r\n";
-      s->reply_len = 5;
-
-    } else {
-      /* ── ROLLBACK ───────────────────────────────────────── */
-
-      /* Send ROLLBACK to remote shards that succeeded */
-      uint32_t rollback_expected = 0;
-      for (uint32_t sid = 0; sid < nshards; sid++) {
-        if (sid == my_id || batches[sid].count == 0)
-          continue;
-        if (!(done_shard_mask & (1U << sid)))
-          continue; /* this shard failed, skip */
-
-        struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
-        struct spsc_message rb = {
-            .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_ROLLBACK),
-            .shard_owner = (uint8_t)my_id,
-        };
-        spsc_queue_push(q, &rb);
-        rollback_expected++;
-      }
-
-      /* Wake remote shards */
-      if (remote_shard_mask && engine->wake_fds) {
-        uint32_t mask = remote_shard_mask;
-        uint32_t sid = 0;
-        while (mask) {
-          if ((mask & 1) && engine->wake_fds[sid] >= 0) {
-            uint64_t one = 1;
-            if (write(engine->wake_fds[sid], &one, sizeof(one)) < 0) {
-            }
-          }
-          mask >>= 1;
-          sid++;
-        }
-      }
-
-      /* Wait for ROLLBACK_ACKs */
-      uint32_t rb_ack_count = 0;
-      while (rb_ack_count < rollback_expected) {
-        for (uint32_t sender = 0; sender < nshards; sender++) {
-          if (sender == my_id)
-            continue;
-          struct spsc_queue *q = r->shard->inboxes[sender];
-          if (!q)
-            continue;
-          struct spsc_message msg;
-          while (spsc_queue_pop(q, &msg)) {
-            uint8_t sys_op = MSG_GET_SYS(msg.op);
-            uint16_t cmd_id = MSG_GET_CMD(msg.op);
-            if (sys_op == MSG_SYS_RELEASE) {
-              if (msg.kv_obj_ptr)
-                shard_obj_unref(r->shard, (struct kv_obj *)msg.kv_obj_ptr);
-              if (msg.reply_buf)
-                slab_obj_free(r->shard->pool, msg.reply_buf);
-            } else if (sys_op == MSG_SYS_REPLY &&
-                       cmd_id == MSG_CMD_MSET_ROLLBACK_ACK) {
-              rb_ack_count++;
-            } else if (sys_op == MSG_SYS_REPLY) {
-              net_reactor_proxy_reply_callback(r, &msg);
-            }
-          }
-        }
-        if (rb_ack_count < rollback_expected)
-          sched_yield();
-      }
-
-      /* Rollback local keys */
-      if (!local_fail && local_batch->count > 0) {
-        for (uint32_t i = 0; i < local_batch->count; i++)
-          shard_key_set_rollback(r->shard, local_batch->entries[i].key,
-                                 local_batch->entries[i].klen,
-                                 (struct kv_obj *)local_batch->old_objs[i]);
-      }
-
-      s->state = PSLOT_LOCAL;
-      s->shard_owner = (uint8_t)my_id;
-      s->reply_type = REPLY_TYPE_ERR;
-      s->reply_data = (uint8_t *)"MSET atomic commit failed";
-      s->reply_len = 25;
-    }
-
-    /* ── Cleanup ────────────────────────────────────────────── */
-    for (uint32_t sid = 0; sid < nshards; sid++) {
-      if (batches[sid].entries)
-        slab_obj_free(r->shard->pool, batches[sid].entries);
-      if (batches[sid].old_objs)
-        slab_obj_free(r->shard->pool, batches[sid].old_objs);
-    }
-    slab_obj_free(r->shard->pool, batches);
-
-    atomic_store(&engine->mset_lock, UINT32_MAX);
-    return 0; /* PSLOT_LOCAL */
+    return 1;  /* PSLOT_PENDING — caller must NOT touch slot state */
   }
 
   if (strcmp(cmd, "DEL") == 0) {
@@ -1307,17 +1090,23 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       uint32_t kowner = shard_for_key(pk, pkl, r->engine->num_shards);
 
       if (kowner == r->shard->id) {
-        /* Local fast-path: delete directly and store formatted result */
-        bool deleted = shard_key_delete(r->shard, pk, pkl);
-        char buf[8];
-        int bl = snprintf(buf, sizeof(buf), ":%d\r\n", deleted ? 1 : 0);
-        s->multi_replies[i] =
-            (uint8_t *)slab_obj_alloc(r->shard->pool, (size_t)bl);
-        if (s->multi_replies[i])
-          memcpy(s->multi_replies[i], buf, (size_t)bl);
-        s->multi_reply_lens[i] = s->multi_replies[i] ? (uint32_t)bl : 0;
-        s->multi_owners[i] = (uint8_t)r->shard->id;
-        s->multi_replied++;
+        struct spsc_message msg = {
+            .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DEL_PART),
+            .shard_owner = (uint8_t)r->shard->id,
+            .conn_ptr = c,
+            .conn_generation = c->generation,
+            .pipeline_idx = pipeline_seq,
+            .sub_idx = i,
+            .req_nb = c->rbuf_nb,
+            .key_ptr = (void *)pk,
+            .key_len = (uint32_t)pkl};
+        enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
+        if (exec_rc == PROXY_EXEC_DONE) {
+          s->multi_replies[i] = (uint8_t *)msg.reply_buf;
+          s->multi_reply_lens[i] = msg.reply_len;
+          s->multi_owners[i] = (uint8_t)r->shard->id;
+          s->multi_replied++;
+        }
       } else {
         struct spsc_queue *q =
             &r->engine->queues[r->shard->id * r->engine->num_shards + kowner];
@@ -1347,6 +1136,9 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
       s->state = PSLOT_DONE;
     return 1;
   }
+
+  if (owner == r->shard->id)
+    return proxy_exec_local_key(r, c, cmd_op, pipeline_seq, p, s, now);
 
   s->shard_owner = (uint8_t)owner;
   /* Copy pre-parsed arguments to slot for the target shard */

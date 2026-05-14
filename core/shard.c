@@ -14,11 +14,54 @@
 #include "../net/conn.h"
 #include "eviction.h"
 #include "htable.h"
+#include "mset_exec.h"
 #include <ctype.h>
 
-/* ── LRU helpers ──────────────────────────────────────────────────────── */
+static bool mixed_profile_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MSET_MIXED_PROFILE");
+    cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+  }
+  return cached != 0;
+}
 
-static inline void lru_node_remove(struct shard *s, struct kv_obj *o) {
+static uint64_t mixed_profile_slow_cycles(void) {
+  static uint64_t cached = 0;
+  if (!cached) {
+    const char *v = getenv("MSET_MIXED_SLOW_US");
+    uint64_t us = v && v[0] ? strtoull(v, NULL, 10) : 1000;
+    if (!us)
+      us = 1000;
+    cached = us * 3000ULL; /* approximate on common 3GHz dev CPUs */
+  }
+  return cached;
+}
+
+static const char *mixed_cmd_name(uint16_t cmd) {
+  switch (cmd) {
+  case MSG_CMD_SET:
+    return "SET";
+  case MSG_CMD_GET:
+    return "GET";
+  case MSG_CMD_MGET_PART:
+    return "MGET_PART";
+  case MSG_CMD_DEL_PART:
+    return "DEL_PART";
+  case MSG_CMD_MSET_KEY:
+    return "MSET_KEY";
+  case MSG_CMD_MSET_KEY_BATCH:
+    return "MSET_BATCH";
+  case MSG_CMD_MSET_FIN:
+    return "MSET_FIN";
+  default:
+    return "OTHER";
+  }
+}
+
+/* ── LRU helpers (non-static — used by mset_exec.c) ──────────────────── */
+
+void lru_node_remove(struct shard *s, struct kv_obj *o) {
   uint32_t p = o->pool_idx;
 
   if (o->lru_prev)
@@ -35,7 +78,7 @@ static inline void lru_node_remove(struct shard *s, struct kv_obj *o) {
   o->lru_next = NULL;
 }
 
-static inline void lru_node_prepend(struct shard *s, struct kv_obj *o) {
+void lru_node_prepend(struct shard *s, struct kv_obj *o) {
   uint32_t p = o->pool_idx;
 
   lru_node_remove(s, o);
@@ -54,6 +97,10 @@ static inline void lru_node_prepend(struct shard *s, struct kv_obj *o) {
 static inline void lru_node_touch(struct shard *s, struct kv_obj *o) {
   lru_node_prepend(s, o);
 }
+
+/* ── LRU external declarations (in shard.h or forward) ───────────────── */
+/* void lru_node_remove(struct shard *s, struct kv_obj *o);               */
+/* void lru_node_prepend(struct shard *s, struct kv_obj *o);              */
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 
@@ -177,17 +224,25 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
   uint64_t t_set = cycles_now();
   /* Pre-check NX/XX condition before allocating — avoids alloc+rollback. */
   if (put_flags & HT_PUT_NX) {
-    if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) != NULL)
+    uint64_t t_h = cycles_now();
+    if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) != NULL) {
+      PROF_RECORD(s->prof.ht_lookup, t_h);
       return false;
+    }
+    PROF_RECORD(s->prof.ht_lookup, t_h);
   } else if (put_flags & HT_PUT_XX) {
-    if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) == NULL)
+    uint64_t t_h = cycles_now();
+    if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) == NULL) {
+      PROF_RECORD(s->prof.ht_lookup, t_h);
       return false;
+    }
+    PROF_RECORD(s->prof.ht_lookup, t_h);
   }
 
   size_t total = sizeof(struct kv_obj) + klen + vlen + 1;
   uint64_t t0 = cycles_now();
   struct kv_obj *o = mem_malloc(total);
-  PROF_RECORD(s->prof.alloc, t0);
+  PROF_RECORD(s->prof.obj_alloc, t0);
   if (!o)
     return false;
 
@@ -215,8 +270,10 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
     PROF_RECORD(s->prof.mark_snap, t_m);
   }
   lru_node_prepend(s, o);
+  uint64_t t_p = cycles_now();
   struct kv_obj *old =
       ht_bucket_put(s->table, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
+  PROF_RECORD(s->prof.ht_insert, t_p);
 
   if (old && old != (struct kv_obj *)(uintptr_t)-1)
     obj_destroy(s, old);
@@ -230,94 +287,17 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
   return ok;
 }
 
-/* ── Atomic MSET helpers ─────────────────────────────────────────────── */
-
-struct kv_obj *shard_key_set_tentative(struct shard *s, const void *key,
-                                       size_t klen, const char *val,
-                                       size_t vlen) {
-  size_t total = sizeof(struct kv_obj) + klen + vlen + 1;
-  struct kv_obj *o = mem_malloc(total);
-  if (!o)
-    return (struct kv_obj *)(uintptr_t)-1; /* allocation failure sentinel */
-
-  o->heap_idx = HEAP_IDX_NONE;
-  o->pool_idx = total <= SMALL_ALLOC_MAX ? pool_idx_get(total) : NR_SMALL_POOLS;
-  o->lru_prev = NULL;
-  o->lru_next = NULL;
-  o->key_len = (uint16_t)klen;
-  o->val_len = (uint32_t)vlen;
-
-  atomic_init(&o->refcount, g_snapshot_active ? 2 : 1);
-  o->marked_deletion = 0;
-  atomic_init(&o->snap_flag, SNAP_FLAG_LIVE_FRESH);
-
-  memcpy(o->data, key, klen);
-  memcpy(o->data + klen, val, vlen);
-  o->data[klen + vlen] = '\0';
-
-  uint32_t obj_size =
-      total <= SMALL_ALLOC_MAX ? POOL_CLASSES[pool_idx_get(total)] : 0;
-  if (g_snapshot_active)
-    snap_obj_mark(&s->snap, s->mem, o, obj_size);
-
-  lru_node_prepend(s, o);
-
-  /* Insert into HT; returns old obj or NULL. No TTL for MSET. */
-  struct kv_obj *old =
-      ht_bucket_put(s->table, o, VAL_TYPE_STRING, 0, HT_PUT_NONE);
-
-  if (old == (struct kv_obj *)(uintptr_t)-1) {
-    /* HT insert failed (overflow OOM) — clean up new obj */
-    lru_node_remove(s, o);
-    mem_free(o);
-    return (struct kv_obj *)(uintptr_t)-1;
-  }
-
-  /* old is the previous kv_obj* (may be NULL if key was new).
-   * We do NOT destroy it — caller holds it for commit/rollback.
-   * Detach from LRU and TTL so eviction/expiry don't interfere. */
-  if (old && old != (struct kv_obj *)(uintptr_t)-1) {
-    lru_node_remove(s, old);
-    if (old->heap_idx != HEAP_IDX_NONE)
-      ttl_index_node_remove(&s->ttl_idx, old);
-  }
-  return old;
-}
-
-void shard_key_set_commit(struct shard *s, struct kv_obj *old_obj) {
-  if (old_obj && old_obj != (struct kv_obj *)(uintptr_t)-1)
-    obj_destroy(s, old_obj);
-}
-
-void shard_key_set_rollback(struct shard *s, const void *key, size_t klen,
-                            struct kv_obj *old_obj) {
-  if (old_obj) {
-    /* Restore old entry: take out the new obj, put back old */
-    struct kv_obj *new_obj =
-        ht_bucket_take(s->table, key, klen, VAL_TYPE_STRING);
-
-    /* Re-insert old_obj. TTL was removed during tentative phase and is not
-     * recoverable here — insert with expire=0. This means a rollback loses
-     * any pre-existing TTL on overwritten keys. Acceptable trade-off since
-     * rollback is the error path. */
-    ht_bucket_put(s->table, old_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
-    lru_node_prepend(s, old_obj);
-
-    /* Destroy new_obj */
-    if (new_obj)
-      obj_destroy(s, new_obj);
-  } else {
-    /* Key didn't exist before — delete what _tentative inserted */
-    shard_key_delete(s, key, klen);
-  }
-}
+/* ── (Old atomic MSET helpers removed — replaced by async 2PC in mset_exec.c)
+ */
 
 struct kv_obj *shard_key_get(struct shard *s, const void *key, size_t klen,
                              uint64_t net_time_ms_get) {
   uint64_t t_get = cycles_now();
   struct kv_obj *expired = NULL;
+  uint64_t t_h = cycles_now();
   struct kv_obj *v = ht_bucket_get_lazy(s->table, key, klen, VAL_TYPE_STRING,
                                         net_time_ms_get, &expired);
+  PROF_RECORD(s->prof.ht_lookup, t_h);
   if (v)
     lru_node_touch(s, v);
   if (expired)
@@ -410,6 +390,15 @@ int shard_ttl_drain(struct shard *s, uint64_t net_time_ms_get, int max_work) {
     struct kv_obj *o = ttl_index_node_pop(idx, &expire_ms);
     if (!o)
       break;
+
+    /* Skip keys locked by MSET — re-push with same TTL */
+    uint64_t meta =
+        ht_meta_pack(ht_key_hash(obj_key_get(o), o->key_len), VAL_TYPE_STRING);
+    if (ht_meta_is_locked(meta)) {
+      ttl_index_node_push(idx, o, expire_ms);
+      continue;
+    }
+
     struct kv_obj *taken =
         ht_bucket_take(s->table, obj_key_get(o), o->key_len, VAL_TYPE_STRING);
     if (taken) {
@@ -426,7 +415,8 @@ static inline uint64_t shard_now_ms(void) {
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-void proxy_exec(struct shard *s, struct spsc_message *msg, uint64_t cur) {
+enum proxy_exec_result proxy_exec(struct shard *s, struct spsc_message *msg,
+                                  uint64_t cur) {
   uint16_t sub_op = MSG_GET_CMD(msg->op);
   struct resp_cmd *cmd = &msg->cmd;
 
@@ -442,6 +432,15 @@ void proxy_exec(struct shard *s, struct spsc_message *msg, uint64_t cur) {
   if (cmd->argc > 1) {
     key = cmd->argv[1];
     klen = cmd->arglen[1];
+  } else if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_MSET_PART ||
+             sub_op == MSG_CMD_DEL_PART) {
+    key = (const char *)msg->key_ptr;
+    klen = msg->key_len;
+  }
+
+  if (key) {
+    if (mset_check_lock_defer(s, msg, key, klen))
+      return PROXY_EXEC_DEFERRED;
   }
 
   if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_MSET_PART ||
@@ -452,7 +451,7 @@ void proxy_exec(struct shard *s, struct spsc_message *msg, uint64_t cur) {
   if (cmd->argc < 1) {
     msg->reply_buf = "invalid proxy cmd";
     msg->reply_len = 17;
-    return;
+    return PROXY_EXEC_DONE;
   }
 
 dispatch:
@@ -672,33 +671,11 @@ dispatch:
     break;
   }
   case MSG_CMD_MSET_PREPARE: {
-    struct mset_batch *batch = (struct mset_batch *)msg->key_ptr;
-    bool any_fail = false;
-    uint32_t i;
-
-    for (i = 0; i < batch->count; i++) {
-      struct kv_obj *old = shard_key_set_tentative(
-          s, batch->entries[i].key, batch->entries[i].klen,
-          batch->entries[i].val, batch->entries[i].vlen);
-      if (old == (struct kv_obj *)(uintptr_t)-1) {
-        /* Allocation failed — rollback all previous tentative SETs */
-        for (uint32_t j = 0; j < i; j++) {
-          shard_key_set_rollback(s, batch->entries[j].key,
-                                 batch->entries[j].klen,
-                                 (struct kv_obj *)batch->old_objs[j]);
-        }
-        any_fail = true;
-        break;
-      }
-      batch->old_objs[i] = old; /* may be NULL if key was new */
-    }
-
-    if (any_fail) {
-      msg->reply_type = REPLY_TYPE_ERR;
-    } else {
-      msg->reply_type = REPLY_TYPE_OK;
-    }
-    /* batch pointer stays valid — coordinator owns the allocation */
+    /* DEPRECATED — old synchronous MSET. Should not arrive anymore.
+     * New protocol uses MSG_CMD_MSET_KEY handled in shard_msg_drain. */
+    msg->reply_type = REPLY_TYPE_ERR;
+    msg->reply_buf = "deprecated MSET_PREPARE";
+    msg->reply_len = 23;
     break;
   }
   default:
@@ -706,6 +683,8 @@ dispatch:
     msg->reply_len = 17;
     break;
   }
+
+  return PROXY_EXEC_DONE;
 }
 
 /* ── SPSC inbox drain ─────────────────────────────────────────────────── */
@@ -729,101 +708,24 @@ static void shard_send_reply(struct shard_engine *engine, struct shard *shard,
   }
 }
 
-/*
- * Participant tight-loop: after receiving MSET_PREPARE and replying DONE,
- * keep draining ONLY the coordinator's inbox until MSET_FIN or MSET_ROLLBACK.
- *
- * During this loop, other message types from the coordinator are still
- * processed normally (RELEASE, regular REQ, REPLY). This keeps the system
- * from deadlocking if there are queued messages ahead of FIN/ROLLBACK.
- */
-static void
-shard_mset_participant_wait(struct shard_engine *engine, struct shard *shard,
-                            uint32_t coordinator_id, struct mset_batch *batch,
-                            shard_proxy_reply_fn proxy_cb, void *proxy_ctx) {
-  struct spsc_queue *q = shard->inboxes[coordinator_id];
-  struct spsc_message msg;
-
-  for (;;) {
-    if (!spsc_queue_pop(q, &msg)) {
-      sched_yield();
-      continue;
-    }
-
-    uint8_t sys_op = MSG_GET_SYS(msg.op);
-    uint16_t cmd_op = MSG_GET_CMD(msg.op);
-
-    /* Handle RELEASE messages normally */
-    if (sys_op == MSG_SYS_RELEASE) {
-      if (msg.kv_obj_ptr)
-        shard_obj_unref(shard, (struct kv_obj *)msg.kv_obj_ptr);
-      if (msg.reply_buf)
-        slab_obj_free(shard->pool, msg.reply_buf);
-      continue;
-    }
-
-    /* Handle REPLY messages normally (forward to reactor callback) */
-    if (sys_op == MSG_SYS_REPLY) {
-      if (proxy_cb)
-        proxy_cb(proxy_ctx, &msg);
-      continue;
-    }
-
-    /* MSG_SYS_REQ */
-    if (cmd_op == MSG_CMD_MSET_FIN) {
-      /* Commit: free all old objects */
-      for (uint32_t i = 0; i < batch->count; i++)
-        shard_key_set_commit(shard, (struct kv_obj *)batch->old_objs[i]);
-      return;
-    }
-
-    if (cmd_op == MSG_CMD_MSET_ROLLBACK) {
-      /* Rollback: restore all old entries, destroy new objects */
-      for (uint32_t i = 0; i < batch->count; i++)
-        shard_key_set_rollback(shard, batch->entries[i].key,
-                               batch->entries[i].klen,
-                               (struct kv_obj *)batch->old_objs[i]);
-      /* Send ACK back */
-      struct spsc_message ack = {
-          .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_ROLLBACK_ACK),
-          .shard_owner = (uint8_t)shard->id,
-          .conn_ptr = msg.conn_ptr,
-          .conn_generation = msg.conn_generation,
-          .pipeline_idx = msg.pipeline_idx,
-      };
-      shard_send_reply(engine, shard, &msg, &ack);
-      return;
-    }
-
-    /* Any other REQ from coordinator during atomic MSET:
-     * execute normally (stale messages queued before PREPARE). */
-    {
-      uint64_t cur = shard_now_ms();
-      proxy_exec(shard, &msg, cur);
-      shard->cross_shard_received++;
-      shard->ops_completed++;
-
-      struct spsc_message reply = {.op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
-                                   .shard_owner = (uint8_t)shard->id,
-                                   .conn_ptr = msg.conn_ptr,
-                                   .conn_generation = msg.conn_generation,
-                                   .pipeline_idx = msg.pipeline_idx,
-                                   .sub_idx = msg.sub_idx,
-                                   .kv_obj_ptr = msg.kv_obj_ptr,
-                                   .old_obj_ptr = msg.old_obj_ptr,
-                                   .reply_buf = msg.reply_buf,
-                                   .reply_len = msg.reply_len,
-                                   .reply_type = msg.reply_type,
-                                   .reply_int = msg.reply_int,
-                                   .req_nb = msg.req_nb};
-      shard_send_reply(engine, shard, &msg, &reply);
-    }
-  }
-}
+/* ── (Old shard_mset_participant_wait removed — replaced by async 2PC) ── */
 
 void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
                      shard_proxy_reply_fn proxy_cb, void *proxy_ctx) {
   uint64_t cur = 0;
+  bool drain_prof = mixed_profile_enabled();
+  uint64_t drain_start = drain_prof ? cycles_now() : 0;
+  uint32_t total_msgs = 0;
+  uint32_t reply_msgs = 0;
+  uint32_t release_msgs = 0;
+  uint32_t req_msgs = 0;
+  uint32_t set_msgs = 0;
+  uint32_t mset_key_msgs = 0;
+  uint32_t mset_batch_msgs = 0;
+  uint32_t mset_fin_msgs = 0;
+  uint32_t other_req_msgs = 0;
+  uint32_t max_sender_run = 0;
+
   for (uint32_t sender = 0; sender < shard->num_shards; sender++) {
     if (sender == shard->id)
       continue;
@@ -833,15 +735,24 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
 
     struct spsc_message msg;
     uint32_t wake_mask = 0;
+    uint32_t sender_run = 0;
     while (spsc_queue_pop(q, &msg)) {
+      if (drain_prof) {
+        total_msgs++;
+        sender_run++;
+      }
       uint8_t sys_op = MSG_GET_SYS(msg.op);
       if (sys_op == MSG_SYS_REPLY) {
+        if (drain_prof)
+          reply_msgs++;
         if (proxy_cb)
           proxy_cb(proxy_ctx, &msg);
         continue;
       }
 
       if (sys_op == MSG_SYS_RELEASE) {
+        if (drain_prof)
+          release_msgs++;
         if (msg.kv_obj_ptr)
           shard_obj_unref(shard, (struct kv_obj *)msg.kv_obj_ptr);
         if (msg.reply_buf)
@@ -850,112 +761,124 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
       }
 
       if (sys_op == MSG_SYS_REQ) {
+        if (drain_prof)
+          req_msgs++;
         if (!cur)
           cur = shard_now_ms();
         uint16_t cmd_op = MSG_GET_CMD(msg.op);
+        bool mix_prof = mixed_profile_enabled();
+        uint64_t q_cycles = 0;
+        uint64_t t_msg = 0;
+        if (mix_prof) {
+          uint64_t now_c = cycles_now();
+          q_cycles = msg.sent_cycles ? now_c - msg.sent_cycles : 0;
+          t_msg = now_c;
+        }
 
-        /* ── Atomic MSET participant path ─────────────────────────── */
-        if (cmd_op == MSG_CMD_MSET_PREPARE) {
-          struct mset_batch *batch = (struct mset_batch *)msg.key_ptr;
-          proxy_exec(shard, &msg, cur);
+        /* ── Async MSET handlers ──────────────────────────────────── */
+        if (cmd_op == MSG_CMD_MSET_KEY) {
+          if (drain_prof)
+            mset_key_msgs++;
+          mset_on_prepare(engine, shard, &msg, cur);
+          if (mix_prof) {
+            uint64_t dur = cycles_now() - t_msg;
+            uint64_t slow = mixed_profile_slow_cycles();
+            if (dur >= slow || q_cycles >= slow)
+              fprintf(stderr,
+                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                      "durcy=%lu deferred=0 ops=1\n",
+                      shard->id, mixed_cmd_name(cmd_op), sender,
+                      (unsigned long)q_cycles, (unsigned long)dur);
+          }
           shard->cross_shard_received++;
-          shard->ops_completed++;
+          continue;
+        }
 
-          if (msg.reply_type == REPLY_TYPE_OK) {
-            /* Save local copies of what we need for FIN/ROLLBACK.
-             * After sending DONE, the coordinator may free the batch
-             * at any time, so we must not reference it after this point. */
-            uint32_t cnt = batch->count;
-
-            void **local_old =
-                slab_obj_alloc(shard->pool, cnt * sizeof(void *));
-            struct mset_batch_entry *local_entries = slab_obj_alloc(
-                shard->pool, cnt * sizeof(struct mset_batch_entry));
-
-            if (!local_old || !local_entries) {
-              /* OOM on local copy — must rollback the tentative SETs and FAIL
-               */
-              for (uint32_t bi = 0; bi < cnt; bi++)
-                shard_key_set_rollback(shard, batch->entries[bi].key,
-                                       batch->entries[bi].klen,
-                                       (struct kv_obj *)batch->old_objs[bi]);
-              if (local_old)
-                slab_obj_free(shard->pool, local_old);
-              if (local_entries)
-                slab_obj_free(shard->pool, local_entries);
-              msg.reply_type = REPLY_TYPE_ERR; /* fall through to FAIL path */
-            } else {
-              for (uint32_t bi = 0; bi < cnt; bi++) {
-                local_old[bi] = batch->old_objs[bi];
-                local_entries[bi] = batch->entries[bi];
-              }
-
-              struct mset_batch local_batch;
-              local_batch.count = cnt;
-              local_batch.entries = local_entries;
-              local_batch.old_objs = local_old;
-
-              /* PREPARE succeeded — send DONE */
-              struct spsc_message reply = {
-                  .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_DONE),
-                  .shard_owner = (uint8_t)shard->id,
-                  .conn_ptr = msg.conn_ptr,
-                  .conn_generation = msg.conn_generation,
-                  .pipeline_idx = msg.pipeline_idx,
-                  .sub_idx = msg.sub_idx,
-                  .reply_type = REPLY_TYPE_OK,
-                  .req_nb = msg.req_nb};
-              shard_send_reply(engine, shard, &msg, &reply);
-
-              /* Enter tight-loop with LOCAL copies */
-              shard_mset_participant_wait(engine, shard, sender, &local_batch,
-                                          proxy_cb, proxy_ctx);
-
-              slab_obj_free(shard->pool, local_old);
-              slab_obj_free(shard->pool, local_entries);
-              continue; /* done with this PREPARE */
-            }
+        if (cmd_op == MSG_CMD_MSET_KEY_BATCH) {
+          if (drain_prof)
+            mset_batch_msgs++;
+          uint32_t batch_count =
+              msg.key_ptr ? ((struct mset_batch *)msg.key_ptr)->count : 0;
+          mset_on_prepare_batch(engine, shard, &msg, cur);
+          if (mix_prof) {
+            uint64_t dur = cycles_now() - t_msg;
+            uint64_t slow = mixed_profile_slow_cycles();
+            if (dur >= slow || q_cycles >= slow)
+              fprintf(stderr,
+                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                      "durcy=%lu deferred=0 ops=%u\n",
+                      shard->id, mixed_cmd_name(cmd_op), sender,
+                      (unsigned long)q_cycles, (unsigned long)dur, batch_count);
           }
+          shard->cross_shard_received++;
+          continue;
+        }
 
-          /* PREPARE failed — send FAIL (either proxy_exec failed, or OOM on
-           * local copy) */
-          {
-            struct spsc_message reply = {
-                .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_FAIL),
-                .shard_owner = (uint8_t)shard->id,
-                .conn_ptr = msg.conn_ptr,
-                .conn_generation = msg.conn_generation,
-                .pipeline_idx = msg.pipeline_idx,
-                .sub_idx = msg.sub_idx,
-                .reply_type = REPLY_TYPE_ERR,
-                .req_nb = msg.req_nb};
-            shard_send_reply(engine, shard, &msg, &reply);
-            /* No tight-loop needed — proxy_exec already rolled back */
+        if (cmd_op == MSG_CMD_MSET_FIN) {
+          if (drain_prof)
+            mset_fin_msgs++;
+          mset_on_fin(engine, shard, &msg, cur);
+          if (mix_prof) {
+            uint64_t dur = cycles_now() - t_msg;
+            uint64_t slow = mixed_profile_slow_cycles();
+            if (dur >= slow || q_cycles >= slow)
+              fprintf(stderr,
+                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                      "durcy=%lu deferred=0 ops=0\n",
+                      shard->id, mixed_cmd_name(cmd_op), sender,
+                      (unsigned long)q_cycles, (unsigned long)dur);
           }
+          shard->cross_shard_received++;
           continue;
         }
 
         /* ── Normal request path ──────────────────────────────────── */
-        proxy_exec(shard, &msg, cur);
+        if (drain_prof) {
+          if (cmd_op == MSG_CMD_SET || cmd_op == MSG_CMD_SET_NX ||
+              cmd_op == MSG_CMD_SET_XX)
+            set_msgs++;
+          else
+            other_req_msgs++;
+        }
+        enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
+        if (mix_prof) {
+          uint64_t dur = cycles_now() - t_msg;
+          uint64_t slow = mixed_profile_slow_cycles();
+          if (dur >= slow || q_cycles >= slow || exec_rc == PROXY_EXEC_DEFERRED)
+            fprintf(stderr,
+                    "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                    "durcy=%lu deferred=%d ops=1\n",
+                    shard->id, mixed_cmd_name(cmd_op), sender,
+                    (unsigned long)q_cycles, (unsigned long)dur,
+                    exec_rc == PROXY_EXEC_DEFERRED);
+        }
 
         shard->cross_shard_received++;
+        if (exec_rc == PROXY_EXEC_DEFERRED) {
+          if (msg.req_nb)
+            net_buf_unref(shard->pool, msg.req_nb);
+          continue;
+        }
+
         shard->ops_completed++;
 
         struct spsc_queue *rq =
             &engine->queues[shard->id * engine->num_shards + msg.shard_owner];
-        struct spsc_message reply = {.op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
-                                     .shard_owner = (uint8_t)shard->id,
-                                     .conn_ptr = msg.conn_ptr,
-                                     .conn_generation = msg.conn_generation,
-                                     .pipeline_idx = msg.pipeline_idx,
-                                     .sub_idx = msg.sub_idx,
-                                     .kv_obj_ptr = msg.kv_obj_ptr,
-                                     .old_obj_ptr = msg.old_obj_ptr,
-                                     .reply_buf = msg.reply_buf,
-                                     .reply_len = msg.reply_len,
-                                     .reply_type = msg.reply_type,
-                                     .reply_int = msg.reply_int,
-                                     .req_nb = msg.req_nb};
+        struct spsc_message reply = {
+            .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
+            .shard_owner = (uint8_t)shard->id,
+            .conn_ptr = msg.conn_ptr,
+            .conn_generation = msg.conn_generation,
+            .pipeline_idx = msg.pipeline_idx,
+            .sub_idx = msg.sub_idx,
+            .kv_obj_ptr = msg.kv_obj_ptr,
+            .old_obj_ptr = msg.old_obj_ptr,
+            .reply_buf = msg.reply_buf,
+            .reply_len = msg.reply_len,
+            .reply_type = msg.reply_type,
+            .reply_int = msg.reply_int,
+            .req_nb = msg.req_nb,
+        };
         while (true) {
           if (spsc_queue_push(rq, &reply)) {
             wake_mask |= (1U << msg.shard_owner);
@@ -965,22 +888,32 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
         }
       }
     }
+    if (drain_prof && sender_run > max_sender_run)
+      max_sender_run = sender_run;
 
-    // After the while loop, iterate over the bitmask and issue write calls
     if (wake_mask && engine->wake_fds) {
       uint32_t p = 0;
       while (wake_mask) {
-        if (wake_mask & 1) {
-          if (engine->wake_fds[p] >= 0) {
-            uint64_t one = 1;
-            if (write(engine->wake_fds[p], &one, sizeof(one)) <
-                0) { /* Handle error or ignore */
-            }
-          }
+        if ((wake_mask & 1) && engine->wake_fds[p] >= 0) {
+          uint64_t one = 1;
+          (void)write(engine->wake_fds[p], &one, sizeof(one));
         }
         wake_mask >>= 1;
         p++;
       }
+    }
+  }
+  if (drain_prof && total_msgs > 0) {
+    uint64_t total_cycles = cycles_now() - drain_start;
+    uint64_t slow = mixed_profile_slow_cycles();
+    if (total_cycles >= slow || total_msgs >= 256 || max_sender_run >= 128) {
+      fprintf(stderr,
+              "[SHARD_DRAIN_PROFILE] shard=%u total_msgs=%u totalcy=%lu "
+              "req=%u reply=%u release=%u set=%u mset_key=%u "
+              "mset_batch=%u mset_fin=%u other_req=%u max_sender_run=%u\n",
+              shard->id, total_msgs, (unsigned long)total_cycles, req_msgs,
+              reply_msgs, release_msgs, set_msgs, mset_key_msgs,
+              mset_batch_msgs, mset_fin_msgs, other_req_msgs, max_sender_run);
     }
   }
 }
@@ -1025,6 +958,13 @@ static bool shard_local_init(struct shard *shard, uint32_t id, int cpu_core,
     return false;
   }
 
+  if (!lock_manager_init(&shard->lm, num_shards, shard->pool)) {
+    slab_alloc_destroy(shard->pool);
+    ht_table_destroy(shard->table);
+    mem_thread_destroy(id);
+    return false;
+  }
+
   shard->inboxes = (struct spsc_queue **)slab_obj_calloc(
       init_pool, num_shards, sizeof(struct spsc_queue *));
   if (!shard->inboxes) {
@@ -1057,6 +997,7 @@ static bool shard_local_init(struct shard *shard, uint32_t id, int cpu_core,
 static void shard_local_cleanup(struct shard *shard,
                                 struct slab_allocator *init_pool) {
   snap_engine_destroy(&shard->snap);
+  lock_manager_destroy(&shard->lm);
   ttl_index_destroy(&shard->ttl_idx);
   slab_obj_free(init_pool, shard->inboxes);
   if (shard->pool)
@@ -1078,7 +1019,8 @@ struct shard_engine *shard_engine_create(struct slab_allocator *init_pool,
     return NULL;
   e->num_shards = num_shards;
   e->init_pool = init_pool;
-  atomic_store(&e->mset_lock, UINT32_MAX);
+  /* mset_inflight and mset_max_concurrent are now per-shard (set in loop below)
+   */
   e->shards = (struct shard *)slab_obj_calloc(init_pool, num_shards,
                                               sizeof(struct shard));
   if (!e->shards) {
@@ -1094,6 +1036,9 @@ struct shard_engine *shard_engine_create(struct slab_allocator *init_pool,
       slab_obj_free(init_pool, e);
       return NULL;
     }
+    e->shards[i].engine = e;
+    e->shards[i].mset_inflight = 0;
+    e->shards[i].mset_max_concurrent = 1000000000;
   }
   e->queues = (struct spsc_queue *)slab_obj_calloc(
       init_pool, (size_t)num_shards * num_shards, sizeof(struct spsc_queue));
@@ -1160,12 +1105,12 @@ void shard_stats_get(const struct shard *s, struct shard_stats *out) {
 void shard_engine_stats_print(const struct shard_engine *e) {
   if (!e)
     return;
-  printf("\n═══════════════════════════════════════════════════════════\n");
-  printf("  struct shard_engine stats  (%u shards)\n", e->num_shards);
-  printf("═══════════════════════════════════════════════════════════\n");
+  printf("\n===========================================================\n");
+  printf("  shard_engine stats  (%u shards)\n", e->num_shards);
+  printf("===========================================================\n");
   printf("%-6s %-5s %-10s %-14s %-11s %-11s\n", "shard", "Core", "Entries",
-         "Ops", "XShard→", "XShard←");
-  printf("───────────────────────────────────────────────────────────\n");
+         "Ops", "XShard->", "XShard<-");
+  printf("-----------------------------------------------------------\n");
   size_t tot_e = 0;
   uint64_t tot_o = 0, tot_s = 0, tot_r = 0;
   for (uint32_t i = 0; i < e->num_shards; i++) {
@@ -1179,72 +1124,240 @@ void shard_engine_stats_print(const struct shard_engine *e) {
     tot_s += st.cross_shard_sent;
     tot_r += st.cross_shard_received;
   }
-  printf("───────────────────────────────────────────────────────────\n");
+  printf("-----------------------------------------------------------\n");
   printf("%-6s %-5s %-10zu %-14lu %-11lu %-11lu\n\n", "TOTAL", "-", tot_e,
          tot_o, tot_s, tot_r);
 
-  printf("  Latency Profiling (Avg CPU Cycles per Op)\n");
-  printf("─────────────────────────────────────────────────────────────────────"
-         "─────────────────────\n");
-  printf("%-6s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n", "shard",
-         "Alloc", "Free(Std)", "Free(Snap)", "Mark", "Merge", "GET", "SET",
-         "SnapTime");
+  /* ── Async MSET 2PC Profiling ─────────────────────────────────── */
+  printf("  Async MSET 2PC Profiling (Avg CPU Cycles per Call)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-28s %-28s %-28s %-28s %-28s %-28s %-28s\n", "shard",
+         "mset_coordinator_dispatch", "mset_exec_prepare",
+         "mset_coordinator_handle_ack", "mset_exec_fin",
+         "mset_coordinator_handle_fin_ack", "mset_drain_waitqueue", "mset_e2e");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf("%-6u %-28lu %-28lu %-28lu %-28lu %-28lu %-28lu %-28lu\n", s->id,
+           s->prof.mset_dispatch.count ? s->prof.mset_dispatch.total_cycles /
+                                             s->prof.mset_dispatch.count
+                                       : 0,
+           s->prof.mset_prepare.count
+               ? s->prof.mset_prepare.total_cycles / s->prof.mset_prepare.count
+               : 0,
+           s->prof.mset_ack.count
+               ? s->prof.mset_ack.total_cycles / s->prof.mset_ack.count
+               : 0,
+           s->prof.mset_fin.count
+               ? s->prof.mset_fin.total_cycles / s->prof.mset_fin.count
+               : 0,
+           s->prof.mset_fin_ack.count
+               ? s->prof.mset_fin_ack.total_cycles / s->prof.mset_fin_ack.count
+               : 0,
+           s->prof.mset_drain.count
+               ? s->prof.mset_drain.total_cycles / s->prof.mset_drain.count
+               : 0,
+           s->prof.mset_total_e2e.count ? s->prof.mset_total_e2e.total_cycles /
+                                              s->prof.mset_total_e2e.count
+                                        : 0);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── mset_exec_prepare Breakdown ─────────────────────────────── */
+  printf("  mset_exec_prepare Breakdown (Avg CPU Cycles per Call)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-20s %-20s %-20s %-20s %-20s %-20s %-20s %-20s\n", "shard",
+         "ht_bucket_get", "alloc_new_obj", "ht_bucket_put(tentative)",
+         "lock_manager_lookup", "lock_manager_insert", "lock_wq_add_mset",
+         "slab_obj_alloc(cmd)", "lock_wq_find_txn");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf("%-6u %-20lu %-20lu %-20lu %-20lu %-20lu %-20lu %-20lu %-20lu\n",
+           s->id,
+           s->prof.ht_lookup.count
+               ? s->prof.ht_lookup.total_cycles / s->prof.ht_lookup.count
+               : 0,
+           s->prof.obj_alloc.count
+               ? s->prof.obj_alloc.total_cycles / s->prof.obj_alloc.count
+               : 0,
+           s->prof.ht_insert.count
+               ? s->prof.ht_insert.total_cycles / s->prof.ht_insert.count
+               : 0,
+           s->prof.lm_lookup.count
+               ? s->prof.lm_lookup.total_cycles / s->prof.lm_lookup.count
+               : 0,
+           s->prof.lm_insert.count
+               ? s->prof.lm_insert.total_cycles / s->prof.lm_insert.count
+               : 0,
+           s->prof.lm_wq_add.count
+               ? s->prof.lm_wq_add.total_cycles / s->prof.lm_wq_add.count
+               : 0,
+           s->prof.slab_alloc.count
+               ? s->prof.slab_alloc.total_cycles / s->prof.slab_alloc.count
+               : 0,
+           s->prof.lm_wq_find.count
+               ? s->prof.lm_wq_find.total_cycles / s->prof.lm_wq_find.count
+               : 0);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── mset_coordinator_dispatch Breakdown ─────────────────────── */
+  printf("  mset_coordinator_dispatch Breakdown (Avg CPU Cycles per Call)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-20s %-20s %-20s %-20s %-20s %-20s\n", "shard",
+         "slab_obj_alloc(stat)", "shard_for_key", "mset_exec_prepare(local)",
+         "spsc_queue_push(wait)", "clock_gettime(txn_now_ns)",
+         "backpressure_wait");
   for (uint32_t i = 0; i < e->num_shards; i++) {
     const struct shard *s = &e->shards[i];
     printf(
-        "%-6u %-10lu %-10lu %-10lu %-10lu %-10lu %-10lu %-10lu %-10lu\n", s->id,
-        s->prof.alloc.count ? s->prof.alloc.total_cycles / s->prof.alloc.count
-                            : 0,
-        s->prof.free_std.count
-            ? s->prof.free_std.total_cycles / s->prof.free_std.count
+        "%-6u %-20lu %-20lu %-20lu %-20lu %-20lu %-20lu\n", s->id,
+        s->prof.coord_stat_alloc.count ? s->prof.coord_stat_alloc.total_cycles /
+                                             s->prof.coord_stat_alloc.count
+                                       : 0,
+        s->prof.coord_hash.count
+            ? s->prof.coord_hash.total_cycles / s->prof.coord_hash.count
             : 0,
-        s->prof.free_snap.count
-            ? s->prof.free_snap.total_cycles / s->prof.free_snap.count
+        s->prof.coord_local_exec.count ? s->prof.coord_local_exec.total_cycles /
+                                             s->prof.coord_local_exec.count
+                                       : 0,
+        s->prof.coord_queue_wait.count ? s->prof.coord_queue_wait.total_cycles /
+                                             s->prof.coord_queue_wait.count
+                                       : 0,
+        s->prof.time_now.count
+            ? s->prof.time_now.total_cycles / s->prof.time_now.count
             : 0,
-        s->prof.mark_snap.count
-            ? s->prof.mark_snap.total_cycles / s->prof.mark_snap.count
-            : 0,
-        s->prof.merge_snap.count
-            ? s->prof.merge_snap.total_cycles / s->prof.merge_snap.count
-            : 0,
-        s->prof.get.count ? s->prof.get.total_cycles / s->prof.get.count : 0,
-        s->prof.set.count ? s->prof.set.total_cycles / s->prof.set.count : 0,
-        s->prof.snap_duration.count
-            ? s->prof.snap_duration.total_cycles / s->prof.snap_duration.count
+        s->prof.coord_backpressure_wait.count
+            ? s->prof.coord_backpressure_wait.total_cycles /
+                  s->prof.coord_backpressure_wait.count
             : 0);
   }
-  printf("─────────────────────────────────────────────────────────────────────"
-         "─────────────────────\n\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
 
-  printf("  Snapshot Profiling (Avg CPU Cycles per Epoch Phase)\n");
-  printf("─────────────────────────────────────────────────────────────────────"
-         "─────────────────────────────────────\n");
-  printf("%-6s %-12s %-12s %-12s %-12s %-12s %-12s\n", "shard", "Total",
-         "IO-Open", "CPU-Scan", "IO-Write", "IO-Close", "Cache-Miss");
+  /* ── Message Queue Latency ────────────────────────────────────── */
+  printf("  Message Queue Latency (Sent to Read Cycles)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-30s %-30s\n", "shard", "mset_prepare_queue_latency",
+         "mset_ack_queue_latency");
   for (uint32_t i = 0; i < e->num_shards; i++) {
     const struct shard *s = &e->shards[i];
-    printf("%-6u %-12lu %-12lu %-12lu %-12lu %-12lu %-12lu\n", s->id,
-           s->prof.snap_duration.count ? s->prof.snap_duration.total_cycles /
-                                             s->prof.snap_duration.count
-                                       : 0,
-           s->prof.snap_open.count
-               ? s->prof.snap_open.total_cycles / s->prof.snap_open.count
+    printf("%-6u %-30lu %-30lu\n", s->id,
+           s->prof.mset_prepare_queue_latency.count
+               ? s->prof.mset_prepare_queue_latency.total_cycles /
+                     s->prof.mset_prepare_queue_latency.count
                : 0,
-           s->prof.snap_scan.count
-               ? s->prof.snap_scan.total_cycles / s->prof.snap_scan.count
-               : 0,
-           s->prof.snap_write.count
-               ? s->prof.snap_write.total_cycles / s->prof.snap_write.count
-               : 0,
-           s->prof.snap_close.count
-               ? s->prof.snap_close.total_cycles / s->prof.snap_close.count
-               : 0,
-           s->prof.snap_cache.count
-               ? s->prof.snap_cache.total_cycles / s->prof.snap_cache.count
+           s->prof.mset_ack_queue_latency.count
+               ? s->prof.mset_ack_queue_latency.total_cycles /
+                     s->prof.mset_ack_queue_latency.count
                : 0);
   }
-  printf("─────────────────────────────────────────────────────────────────────"
-         "─────────────────────────────────────\n\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── Latency Profiling ────────────────────────────────────────── */
+  printf("  Latency Profiling (Avg CPU Cycles per Op)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-12s %-12s %-12s %-12s %-12s\n", "shard", "shard_key_get",
+         "shard_key_set", "slab_obj_alloc", "wake_write", "queue_push");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf("%-6u %-12lu %-12lu %-12lu %-12lu %-12lu\n", s->id,
+           s->prof.get.count ? s->prof.get.total_cycles / s->prof.get.count : 0,
+           s->prof.set.count ? s->prof.set.total_cycles / s->prof.set.count : 0,
+           s->prof.slab_alloc.count
+               ? s->prof.slab_alloc.total_cycles / s->prof.slab_alloc.count
+               : 0,
+           s->prof.wake_write.count
+               ? s->prof.wake_write.total_cycles / s->prof.wake_write.count
+               : 0,
+           s->prof.queue_push.count
+               ? s->prof.queue_push.total_cycles / s->prof.queue_push.count
+               : 0);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── Lock Contention Stats ────────────────────────────────────── */
+  printf("  Lock Contention Stats (Counts)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-25s %-25s %-25s\n", "shard", "preempt_attempts",
+         "preempt_successes", "wait_queue_adds");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf("%-6u %-25lu %-25lu %-25lu\n", s->id,
+           s->prof.lm_preempt_attempt.count, s->prof.lm_preempt_success.count,
+           s->prof.lm_wq_add.count);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+  /* ── MSET Call Counts ──────────────────────────────────────────────── */
+  printf("  MSET Call Counts\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n",
+         "shard", "dispatch", "prepare", "ack", "fin", "fin_ack", "drain",
+         "e2e", "ht_insert", "lm_insert");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf(
+        "%-6u %-12lu %-12lu %-12lu %-12lu %-12lu %-12lu %-12lu %-12lu %-12lu\n",
+        s->id, s->prof.mset_dispatch.count, s->prof.mset_prepare.count,
+        s->prof.mset_ack.count, s->prof.mset_fin.count,
+        s->prof.mset_fin_ack.count, s->prof.mset_drain.count,
+        s->prof.mset_total_e2e.count, s->prof.ht_insert.count,
+        s->prof.lm_insert.count);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── MSET PREPARE Round-Trip Percentiles ────────────────────────────── */
+  printf("  MSET PREPARE Round-Trip Percentiles (cycles)  "
+         "[dispatch → all ACKs received]\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-14s %-14s %-14s %-14s %-14s %-14s\n", "shard", "p50", "p75",
+         "p95", "p99", "p999", "max");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    uint64_t total = s->prof.mset_prepare_rtt.count;
+    printf("%-6u %-14lu %-14lu %-14lu %-14lu %-14lu %-14lu\n", s->id,
+           hist_percentile(&s->prof.mset_prepare_rtt_hist, total, 0.50),
+           hist_percentile(&s->prof.mset_prepare_rtt_hist, total, 0.75),
+           hist_percentile(&s->prof.mset_prepare_rtt_hist, total, 0.95),
+           hist_percentile(&s->prof.mset_prepare_rtt_hist, total, 0.99),
+           hist_percentile(&s->prof.mset_prepare_rtt_hist, total, 0.999),
+           s->prof.mset_prepare_rtt.max_cycles);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
+
+  /* ── MSET E2E Latency Percentiles ───────────────────────────────────── */
+  printf("  MSET E2E Latency Percentiles (cycles)\n");
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n");
+  printf("%-6s %-14s %-14s %-14s %-14s %-14s %-14s\n", "shard", "p50", "p75",
+         "p95", "p99", "p999", "max");
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    uint64_t total = s->prof.mset_total_e2e.count;
+    printf("%-6u %-14lu %-14lu %-14lu %-14lu %-14lu %-14lu\n", s->id,
+           hist_percentile(&s->prof.mset_e2e_hist, total, 0.50),
+           hist_percentile(&s->prof.mset_e2e_hist, total, 0.75),
+           hist_percentile(&s->prof.mset_e2e_hist, total, 0.95),
+           hist_percentile(&s->prof.mset_e2e_hist, total, 0.99),
+           hist_percentile(&s->prof.mset_e2e_hist, total, 0.999),
+           s->prof.mset_total_e2e.max_cycles);
+  }
+  printf("---------------------------------------------------------------------"
+         "-----------------------------------------------------------\n\n");
 }
 
 bool shard_mem_evict(struct shard *s, size_t size_req) {

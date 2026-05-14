@@ -212,6 +212,19 @@ struct kv_obj *ht_bucket_get_lazy(struct hash_table *ht, const void *key,
                                   uint64_t net_time_ms_get,
                                   struct kv_obj **expired_out);
 
+/*
+ * ht_bucket_set_lock_status — sets or clears the lock bit in the bucket meta.
+ * Returns true if successful, false if key not found.
+ */
+bool ht_bucket_set_lock_status(struct hash_table *ht, const void *key,
+                               size_t klen, enum val_type type, bool locked);
+
+/*
+ * ht_bucket_is_locked — returns true if the key is currently locked in the HT.
+ */
+bool ht_bucket_is_locked(struct hash_table *ht, const void *key, size_t klen,
+                         enum val_type type);
+
 /* ht_bucket_take — remove and return obj (caller frees it). */
 struct kv_obj *ht_bucket_take(struct hash_table *ht, const void *key,
                               size_t klen, enum val_type type);

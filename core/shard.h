@@ -15,6 +15,7 @@
 #include "../hashtable/htable.h"
 #include "../mem/mem_heap.h"
 #include "../memory/slab.h"
+#include "lock_manager.h"
 #include "message.h"
 #include "object.h"
 #include "profile.h"
@@ -24,16 +25,38 @@
 
 #define LRU_POOLS (NR_SMALL_POOLS + 1)
 
+typedef void (*shard_proxy_reply_fn)(void *ctx, const struct spsc_message *msg);
+struct net_conn;
+typedef void (*shard_conn_dirty_fn)(void *ctx, struct net_conn *c,
+                                    const char *reason);
+
+struct shard_engine;  /* forward declaration — defined below */
+
 struct shard {
   uint32_t id;
   int cpu_core;
   pthread_t thread;
   bool running;
 
+  struct shard_engine *engine;  /* back-pointer to parent engine */
+
+  /* Per-shard MSET back-pressure: limits concurrent in-flight MSETs for
+   * this coordinator, independent of other shards. Single-threaded access
+   * (reactor thread only) — no atomic needed. */
+  uint32_t mset_inflight;
+  uint32_t mset_max_concurrent;
+
+  /* Callback used by mset back-pressure drain (set by reactor at init). */
+  shard_proxy_reply_fn proxy_cb;
+  shard_conn_dirty_fn mark_conn_dirty_cb;
+  void *mark_conn_dirty_ctx;
+
   struct hash_table *table;
   struct thread_heap *mem; /* Pointer to thread-local heap in g_thread_heaps */
   struct ttl_index ttl_idx;
   struct slab_allocator *pool;
+
+  struct lock_manager lm;  /* key-level lock manager for async MSET */
 
   struct spsc_queue **inboxes;
   uint32_t num_shards;
@@ -45,6 +68,11 @@ struct shard {
   uint64_t ops_completed;
   uint64_t cross_shard_sent;
   uint64_t cross_shard_received;
+  uint64_t mset_debug_last_ms;
+  uint64_t mset_debug_progress_last_ms;
+  uint64_t mset_debug_last_dispatch;
+  uint64_t mset_debug_last_e2e;
+  bool mset_debug_all_complete_logged;
 
   struct snap_state snap;
   struct shard_prof prof;
@@ -57,12 +85,10 @@ struct shard_engine {
   struct spsc_queue *queues;
   int *wake_fds;
 
-  /* Global lock for atomic MSET: UINT32_MAX = free, otherwise = owner shard id
-   */
-  _Atomic uint32_t mset_lock;
-
   /* Allocator for engine-level structures */
   struct slab_allocator *init_pool;
+
+  /* (mset_inflight and mset_max_concurrent moved to struct shard) */
 };
 
 /* ── Engine lifecycle ─────────────────────────────────────────────────── */
@@ -82,33 +108,13 @@ void shard_obj_destroy(struct shard *s, struct kv_obj *o);
 void shard_obj_ref(struct kv_obj *o);
 void shard_obj_unref(struct shard *s, struct kv_obj *o);
 
+/* LRU helpers (used by mset_exec.c) */
+void lru_node_remove(struct shard *s, struct kv_obj *o);
+void lru_node_prepend(struct shard *s, struct kv_obj *o);
+
 bool shard_key_set(struct shard *s, const void *key, size_t klen,
                    const char *val, size_t vlen, uint64_t expire_ms,
                    uint32_t put_flags);
-
-/*
- * shard_key_set_tentative — Phase 1 of atomic MSET.
- * Allocates new kv_obj and replaces HT entry, but does NOT free old_obj.
- * Returns old_obj (caller must hold it for commit/rollback), or NULL if key was
- * new. Returns (kv_obj*)-1 on allocation failure.
- */
-struct kv_obj *shard_key_set_tentative(struct shard *s, const void *key,
-                                       size_t klen, const char *val,
-                                       size_t vlen);
-
-/*
- * shard_key_set_commit — Phase 2a: finalize tentative SET.
- * Destroys old_obj (the one returned by _tentative).
- */
-void shard_key_set_commit(struct shard *s, struct kv_obj *old_obj);
-
-/*
- * shard_key_set_rollback — Phase 2b: undo tentative SET.
- * Restores old_obj into HT, destroys the new_obj that was placed by _tentative.
- * If old_obj is NULL, deletes the key entirely.
- */
-void shard_key_set_rollback(struct shard *s, const void *key, size_t klen,
-                            struct kv_obj *old_obj);
 
 struct kv_obj *shard_key_get(struct shard *s, const void *key, size_t klen,
                              uint64_t net_time_ms_get);
@@ -128,11 +134,14 @@ int shard_ttl_drain(struct shard *s, uint64_t net_time_ms_get, int max_work);
 
 /* ── SPSC drain ───────────────────────────────────────────────────────── */
 
-typedef void (*shard_proxy_reply_fn)(void *ctx, const struct spsc_message *msg);
-
 void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
                      shard_proxy_reply_fn proxy_cb, void *proxy_ctx);
-void proxy_exec(struct shard *s, struct spsc_message *msg, uint64_t cur);
+enum proxy_exec_result {
+  PROXY_EXEC_DONE = 0,
+  PROXY_EXEC_DEFERRED = 1,
+};
+enum proxy_exec_result proxy_exec(struct shard *s, struct spsc_message *msg,
+                                  uint64_t cur);
 
 /* ── Stats ────────────────────────────────────────────────────────────── */
 

@@ -1,4 +1,5 @@
 #include "htable.h"
+#include "../core/lock_manager.h"
 #include "../mem/mem_api.h"
 #include "hash.h"
 
@@ -80,7 +81,7 @@ static struct bucket *ht_chain_node_find(struct bucket *base, size_t idx,
                                          struct bucket **prev_out) {
   struct bucket *prev = NULL, *cur = &base[idx];
   while (cur) {
-    if (cur->meta == meta && cur->obj->key_len == (uint16_t)klen &&
+    if ((cur->meta & ~HT_META_LOCK_BIT) == meta && cur->obj->key_len == (uint16_t)klen &&
         memcmp(cur->obj->data, key, klen) == 0) {
       if (prev_out)
         *prev_out = prev;
@@ -372,9 +373,34 @@ struct kv_obj *ht_bucket_get_lazy(struct hash_table *ht, const void *key,
     return NULL;
   if (f->expire == 0 || net_time_ms_get == 0 || net_time_ms_get < f->expire)
     return f->obj;
+  /* Key expired — but if locked by MSET, skip expiry */
+  if (ht_meta_is_locked(f->meta))
+    return f->obj;
   *expired_out = f->obj;
   ht_bucket_node_unlink(ht, prev, f);
   return NULL;
+}
+
+bool ht_bucket_set_lock_status(struct hash_table *ht, const void *key,
+                               size_t klen, enum val_type type, bool locked) {
+  uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), type);
+  struct bucket *f = ht_key_lookup(ht, meta, key, klen, NULL);
+  if (!f)
+    return false;
+  if (locked)
+    ht_meta_lock_set(&f->meta);
+  else
+    ht_meta_lock_clear(&f->meta);
+  return true;
+}
+
+bool ht_bucket_is_locked(struct hash_table *ht, const void *key, size_t klen,
+                         enum val_type type) {
+  uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), type);
+  struct bucket *f = ht_key_lookup(ht, meta, key, klen, NULL);
+  if (!f)
+    return false;
+  return ht_meta_is_locked(f->meta);
 }
 
 struct kv_obj *ht_bucket_take(struct hash_table *ht, const void *key,

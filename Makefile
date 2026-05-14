@@ -5,7 +5,7 @@
 #   make clean            — remove build artefacts
 
 CC      := gcc
-CFLAGS  := -std=c11 -O3 -Wall -Wextra -Wpedantic \
+CFLAGS  := -std=c11 -O1 -g -Wall -Wextra -Wpedantic \
             -Wno-unused-parameter \
             -D_GNU_SOURCE \
             -march=native \
@@ -14,6 +14,11 @@ CFLAGS  := -std=c11 -O3 -Wall -Wextra -Wpedantic \
 
 LDFLAGS := -lpthread
 
+ifeq ($(ASAN),1)
+    CFLAGS  += -fsanitize=address
+    LDFLAGS += -fsanitize=address
+endif
+
 TARGET   := freakv
 
 # ── Sources ────────────────────────────────────────────────────────────
@@ -21,6 +26,8 @@ TARGET   := freakv
 LIB_SRCS := \
     core/shard.c \
     core/snapshot.c \
+    core/lock_manager.c \
+    core/mset_exec.c \
     hashtable/htable.c \
     hashtable/hash.c \
     mem/mem_api.c \

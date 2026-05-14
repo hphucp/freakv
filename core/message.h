@@ -58,13 +58,21 @@ enum resp_cmd_id {
   MSG_CMD_SET_XX = 103,
   MSG_CMD_DEL_PART = 104,
 
-  /* Atomic MSET 2-phase commit protocol */
-  MSG_CMD_MSET_PREPARE = 200,  /* coordinator → participant: tentative SET  */
-  MSG_CMD_MSET_DONE = 201,     /* participant → coordinator: prepare OK     */
-  MSG_CMD_MSET_FAIL = 202,     /* participant → coordinator: prepare failed */
-  MSG_CMD_MSET_FIN = 203,      /* coordinator → participant: commit         */
-  MSG_CMD_MSET_ROLLBACK = 204, /* coordinator → participant: abort          */
-  MSG_CMD_MSET_ROLLBACK_ACK = 205, /* participant → coordinator: abort done */
+  /* ── Old synchronous MSET protocol (DEPRECATED — kept for enum stability) */
+  MSG_CMD_MSET_PREPARE = 200,      /* DEPRECATED — do not use              */
+  MSG_CMD_MSET_DONE = 201,         /* DEPRECATED — do not use              */
+  MSG_CMD_MSET_FAIL = 202,         /* DEPRECATED — do not use              */
+
+  /* ── Async MSET 2PC protocol (new) ──────────────────────────────────── */
+  MSG_CMD_MSET_FIN = 203,          /* coordinator → exec: commit           */
+  MSG_CMD_MSET_KEY = 210,          /* coordinator → exec: per-key PREPARE  */
+  MSG_CMD_MSET_ACK = 211,          /* last exec → coordinator: all done    */
+  MSG_CMD_MSET_FIN_ACK = 212,      /* last exec → coordinator: FIN complete*/
+  MSG_CMD_MSET_KEY_BATCH = 213,    /* coordinator → exec: all keys for one shard */
+
+  /* DEPRECATED */
+  MSG_CMD_MSET_ROLLBACK = 204,     /* DEPRECATED — do not use              */
+  MSG_CMD_MSET_ROLLBACK_ACK = 205, /* DEPRECATED — do not use              */
 };
 
 /*
@@ -74,15 +82,22 @@ enum resp_cmd_id {
  */
 struct mset_batch_entry {
   const char *key;
-  size_t klen;
+  size_t      klen;
   const char *val;
-  size_t vlen;
+  size_t      vlen;
+  uint32_t    sub_idx; /* original pair index in MSET — needed for cmd_info tracking */
 };
 
+/*
+ * Per-shard batch: coordinator allocates one of these per remote shard.
+ * Header + entries are a single slab allocation; coordinator frees via
+ * stat->batch_cleanup_head linked list in stat_free_real.
+ * Participant reads entries[] read-only; never frees.
+ */
 struct mset_batch {
-  uint32_t count;                   /* number of entries                  */
-  struct mset_batch_entry *entries; /* array of key-value pairs           */
-  void **old_objs;                  /* filled by participant: old kv_obj* */
+  struct mset_batch *cleanup_next; /* intrusive list for stat_free_real    */
+  uint32_t           count;        /* number of entries                    */
+  struct mset_batch_entry entries[]; /* C99 flexible array — entries follow */
 };
 
 enum msg_reply_type {
@@ -124,6 +139,7 @@ struct spsc_message {
   uint8_t _pad1;
   uint16_t _pad2;
   int64_t reply_int; /* For INT replies */
+  uint64_t sent_cycles; /* Timestamp when message was pushed to queue */
 };
 
 #endif /* MESSAGE_H */
