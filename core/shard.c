@@ -1038,7 +1038,7 @@ struct shard_engine *shard_engine_create(struct slab_allocator *init_pool,
     }
     e->shards[i].engine = e;
     e->shards[i].mset_inflight = 0;
-    e->shards[i].mset_max_concurrent = 1000000000;
+    e->shards[i].mset_max_concurrent = 20;
   }
   e->queues = (struct spsc_queue *)slab_obj_calloc(
       init_pool, (size_t)num_shards * num_shards, sizeof(struct spsc_queue));
@@ -1127,6 +1127,27 @@ void shard_engine_stats_print(const struct shard_engine *e) {
   printf("-----------------------------------------------------------\n");
   printf("%-6s %-5s %-10zu %-14lu %-11lu %-11lu\n\n", "TOTAL", "-", tot_e,
          tot_o, tot_s, tot_r);
+
+  printf("  MSET Connection-Level Pending\n");
+  printf("-----------------------------------------------------------\n");
+  printf("%-6s %-14s %-14s %-10s %-10s\n", "shard", "enqueued",
+         "resumed", "cur_len", "max_len");
+  uint64_t pending_enq = 0, pending_res = 0;
+  uint32_t pending_cur = 0, pending_max = 0;
+  for (uint32_t i = 0; i < e->num_shards; i++) {
+    const struct shard *s = &e->shards[i];
+    printf("%-6u %-14lu %-14lu %-10u %-10u\n", s->id,
+           s->mset_pending_conn_enqueued, s->mset_pending_conn_resumed,
+           s->mset_pending_conn_len, s->mset_pending_conn_max_len);
+    pending_enq += s->mset_pending_conn_enqueued;
+    pending_res += s->mset_pending_conn_resumed;
+    pending_cur += s->mset_pending_conn_len;
+    if (s->mset_pending_conn_max_len > pending_max)
+      pending_max = s->mset_pending_conn_max_len;
+  }
+  printf("-----------------------------------------------------------\n");
+  printf("%-6s %-14lu %-14lu %-10u %-10u\n\n", "TOTAL", pending_enq,
+         pending_res, pending_cur, pending_max);
 
   /* ── Async MSET 2PC Profiling ─────────────────────────────────── */
   printf("  Async MSET 2PC Profiling (Avg CPU Cycles per Call)\n");

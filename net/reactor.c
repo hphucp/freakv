@@ -180,6 +180,7 @@ static void net_slot_reset(struct reactor *r, struct net_pipeline_slot *s);
 static void net_conn_free(struct reactor *r, struct net_conn *c) {
   if (!c)
     return;
+  mset_pending_conn_cancel(r->shard, c);
   if (c->rbuf_nb)
     net_buf_unref(r->shard->pool, c->rbuf_nb);
   if (c->wbuf)
@@ -243,6 +244,7 @@ static inline void net_reactor_mark_dead(struct reactor *r,
                                          struct net_conn *c) {
   if (c->list_type == 2)
     return;
+  mset_pending_conn_cancel(r->shard, c);
   net_reactor_list_remove(r, c);
 
   /* Close FD immediately if it's still open */
@@ -863,6 +865,8 @@ static void net_accept_shared_handler(struct reactor *r) {
 static void net_read_handler(struct reactor *r, struct net_conn *c) {
   if (!c)
     return;
+  if (c->pending_reason != CONN_PENDING_NONE)
+    return;
   handle_read_resp(r, c);
   net_reactor_mark_dirty_reason(r, c, "read_handler");
 }
@@ -875,6 +879,7 @@ static void net_reactor_proxy_reply_callback(void *ctx,
   uint16_t cmd_id = MSG_GET_CMD(msg->op);
   if (cmd_id == MSG_CMD_MSET_ACK) {
     mset_on_ack(r->engine, r->shard, (struct spsc_message *)msg);
+    mset_pending_conn_drain(r, 8);
     /* Mark dirty: mset_on_ack may have set +OK reply locally (if local
      * coordinator processed the last FIN key).  If FINs are still pending,
      * the slot is PSLOT_PENDING and the flush is a safe no-op. */
@@ -886,6 +891,7 @@ static void net_reactor_proxy_reply_callback(void *ctx,
 
   if (cmd_id == MSG_CMD_MSET_FIN_ACK) {
     mset_on_fin_ack(r->engine, r->shard, (struct spsc_message *)msg);
+    mset_pending_conn_drain(r, 8);
     /* +OK reply is now set in the pipeline slot — flush to client */
     struct net_conn *c = (struct net_conn *)msg->conn_ptr;
     if (c && c->generation == msg->conn_generation)
@@ -1063,6 +1069,7 @@ void net_reactor_run(struct reactor *r) {
   while (r->shard->running) {
     /* 1. Sync cross-shard replies into pipeline slots */
     shard_msg_drain(r->engine, r->shard, net_reactor_proxy_reply_callback, r);
+    mset_pending_conn_drain(r, 8);
 
     /* 2. Wait for network events */
     int nev = epoll_wait(r->epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
@@ -1128,6 +1135,13 @@ void net_reactor_run(struct reactor *r) {
       net_mset_log_dirty_event(r, curr, "pop", "master_flush", dirty_pop_ms);
       net_reactor_list_remove(r, curr);
 
+      if (curr->fd >= 0 && curr->pending_reason == CONN_PENDING_NONE &&
+          curr->resp.rbuf_parsed < curr->rbuf_len) {
+        handle_read_resp(r, curr);
+        if (curr->state == CONN_DEAD)
+          continue;
+      }
+
       /* Drain the pipeline and attempt write if FD is still open */
       net_pipeline_try_flush(r, curr);
 
@@ -1148,6 +1162,8 @@ void net_reactor_run(struct reactor *r) {
       net_conn_try_free(r, dead);
       dead = next;
     }
+
+    mset_pending_conn_drain(r, 8);
   }
 }
 

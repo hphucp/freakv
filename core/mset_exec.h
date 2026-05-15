@@ -39,6 +39,9 @@ struct resp_parser;
 int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
                               struct resp_parser *p, uint32_t pipeline_seq);
 
+void mset_pending_conn_drain(struct reactor *r, uint32_t budget);
+void mset_pending_conn_cancel(struct shard *shard, struct net_conn *c);
+
 /* ── Coordinator: incoming messages ─────────────────────────────────── */
 
 /*

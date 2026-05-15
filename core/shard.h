@@ -45,6 +45,12 @@ struct shard {
    * (reactor thread only) — no atomic needed. */
   uint32_t mset_inflight;
   uint32_t mset_max_concurrent;
+  struct net_conn *mset_pending_conn_head;
+  struct net_conn *mset_pending_conn_tail;
+  uint32_t mset_pending_conn_len;
+  uint64_t mset_pending_conn_enqueued;
+  uint64_t mset_pending_conn_resumed;
+  uint32_t mset_pending_conn_max_len;
 
   /* Callback used by mset back-pressure drain (set by reactor at init). */
   shard_proxy_reply_fn proxy_cb;

@@ -77,20 +77,23 @@ main(int argc, char **argv)
     uint16_t port       = DEFAULT_PORT;
     uint32_t num_shards = DEFAULT_SHARDS;
     uint64_t maxmemory  = 0;   /* 0 = unlimited */
+    uint32_t mset_max_concurrent = 20;
     const char *snap_dir = "";
     uint32_t snap_interval = 0; /* milliseconds, 0 = disabled */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--port")      && i+1 < argc) port       = (uint16_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shards")    && i+1 < argc) num_shards = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mset_max_concurrent") && i+1 < argc) mset_max_concurrent = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--maxmemory") && i+1 < argc) maxmemory  = server_size_parse(argv[++i]);
         else if (!strcmp(argv[i], "--snapshot-dir") && i+1 < argc) snap_dir = argv[++i];
         else if (!strcmp(argv[i], "--snapshot-interval") && i+1 < argc) snap_interval = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("Usage: %s [--port <port>] [--shards <n>] [--maxmemory <size>]\n"
+            printf("Usage: %s [--port <port>] [--shards <n>] [--mset_max_concurrent <n>] [--maxmemory <size>]\n"
                    "       [--snapshot-dir <path>] [--snapshot-interval <milliseconds>]\n\n"
                    "  --port               TCP port to listen on  (default %d)\n"
                    "  --shards             number of shards/cores (default = nproc)\n"
+                   "  --mset_max_concurrent max in-flight MSET coordinators per shard (default 20)\n"
                    "  --maxmemory          max total memory e.g. 500M, 2G, 0=unlimited\n"
                    "  --snapshot-dir       directory for snapshot files (enables persistence)\n"
                    "  --snapshot-interval  milliseconds between snapshots (default 0 = off)\n",
@@ -149,6 +152,15 @@ main(int argc, char **argv)
     }
     num_shards = g_engine->num_shards;
     printf("[server] %u shard(s) created\n", num_shards);
+
+    if (mset_max_concurrent == 0) {
+        mset_max_concurrent = 1;
+    }
+    for (uint32_t i = 0; i < num_shards; i++) {
+        g_engine->shards[i].mset_max_concurrent = mset_max_concurrent;
+    }
+    printf("[server] mset_max_concurrent=%u per shard\n",
+           mset_max_concurrent);
 
     if (maxmemory > 0) {
         uint64_t per_shard = maxmemory / num_shards;
@@ -259,5 +271,3 @@ main(int argc, char **argv)
      * the cost of iterating millions of kv_obj entries in shard_engine_destroy. */
     exit(0);
 }
-
-

@@ -25,6 +25,14 @@ extern enum proxy_exec_result proxy_exec(struct shard *s,
                                          struct spsc_message *msg,
                                          uint64_t cur);
 
+static int mset_coordinator_dispatch_argv(struct reactor *r,
+                                          struct net_conn *c,
+                                          uint32_t pipeline_seq,
+                                          uint32_t argc,
+                                          char **argv,
+                                          size_t *arglen,
+                                          struct net_buf *req_nb);
+
 /* ── Low-level helpers ───────────────────────────────────────────────── */
 
 static inline void send_to_shard(struct shard_engine *engine, uint32_t from,
@@ -210,8 +218,9 @@ static void mset_debug_dump_stat(struct shard *shard, struct mset_stat *stat,
   }
 }
 
-static void mset_debug_backpressure(struct reactor *r, struct net_conn *c,
-                                    uint64_t cur_ms) {
+static __attribute__((unused)) void
+mset_debug_backpressure(struct reactor *r, struct net_conn *c,
+                        uint64_t cur_ms) {
   struct shard *shard = r->shard;
   if (!mset_debug_enabled())
     return;
@@ -1869,45 +1878,205 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
 
 /* ── Public entry points ─────────────────────────────────────────────── */
 
+static void mset_pending_state_free(struct shard *shard, struct net_conn *c) {
+  if (!c)
+    return;
+  if (c->pending_argv) {
+    slab_obj_free(shard->pool, c->pending_argv);
+    c->pending_argv = NULL;
+  }
+  if (c->pending_arglen) {
+    slab_obj_free(shard->pool, c->pending_arglen);
+    c->pending_arglen = NULL;
+  }
+  if (c->pending_req_nb) {
+    net_buf_unref(shard->pool, c->pending_req_nb);
+    c->pending_req_nb = NULL;
+  }
+  c->pending_argc = 0;
+  c->pending_pipeline_idx = 0;
+  c->pending_reason = CONN_PENDING_NONE;
+}
+
+void mset_pending_conn_cancel(struct shard *shard, struct net_conn *c) {
+  if (!shard || !c)
+    return;
+
+  if (c->pending_queued) {
+    struct net_conn *prev = NULL;
+    struct net_conn *cur = shard->mset_pending_conn_head;
+    while (cur) {
+      if (cur == c) {
+        if (prev)
+          prev->pending_next = cur->pending_next;
+        else
+          shard->mset_pending_conn_head = cur->pending_next;
+        if (shard->mset_pending_conn_tail == cur)
+          shard->mset_pending_conn_tail = prev;
+        if (shard->mset_pending_conn_len > 0)
+          shard->mset_pending_conn_len--;
+        break;
+      }
+      prev = cur;
+      cur = cur->pending_next;
+    }
+    c->pending_next = NULL;
+    c->pending_queued = false;
+  }
+
+  if (c->pending_reason == CONN_PENDING_MSET_BP && c->proxy.slots &&
+      c->proxy.cap) {
+    struct net_pipeline_slot *ps =
+        &c->proxy.slots[c->pending_pipeline_idx & (c->proxy.cap - 1)];
+    if (ps->state == PSLOT_PENDING && ps->parent_cmd_id == MSG_CMD_MSET_PART &&
+        ps->kv_obj_ptr == NULL) {
+      ps->state = PSLOT_DONE;
+    }
+  }
+  mset_pending_state_free(shard, c);
+}
+
+static int mset_pending_conn_enqueue(struct reactor *r, struct net_conn *c,
+                                     struct resp_parser *p,
+                                     uint32_t pipeline_seq) {
+  struct shard *shard = r->shard;
+  if (c->pending_reason != CONN_PENDING_NONE)
+    return -1;
+
+  char **argv =
+      (char **)slab_obj_alloc(shard->pool, p->argc_got * sizeof(char *));
+  size_t *arglen =
+      (size_t *)slab_obj_alloc(shard->pool, p->argc_got * sizeof(size_t));
+  if (!argv || !arglen) {
+    if (argv)
+      slab_obj_free(shard->pool, argv);
+    if (arglen)
+      slab_obj_free(shard->pool, arglen);
+    return -1;
+  }
+  memcpy(argv, p->argv, p->argc_got * sizeof(char *));
+  memcpy(arglen, p->arglen, p->argc_got * sizeof(size_t));
+
+  struct net_pipeline_slot *ps =
+      &c->proxy.slots[pipeline_seq & (c->proxy.cap - 1)];
+  ps->state = PSLOT_PENDING;
+  ps->parent_cmd_id = MSG_CMD_MSET_PART;
+  ps->kv_obj_ptr = NULL;
+
+  c->pending_reason = CONN_PENDING_MSET_BP;
+  c->pending_pipeline_idx = pipeline_seq;
+  c->pending_req_nb = c->rbuf_nb;
+  c->pending_argc = p->argc_got;
+  c->pending_argv = argv;
+  c->pending_arglen = arglen;
+  if (c->pending_req_nb)
+    net_buf_ref(c->pending_req_nb);
+
+  if (!c->pending_queued) {
+    c->pending_next = NULL;
+    if (shard->mset_pending_conn_tail)
+      shard->mset_pending_conn_tail->pending_next = c;
+    else
+      shard->mset_pending_conn_head = c;
+    shard->mset_pending_conn_tail = c;
+    shard->mset_pending_conn_len++;
+    shard->mset_pending_conn_enqueued++;
+    if (shard->mset_pending_conn_len > shard->mset_pending_conn_max_len)
+      shard->mset_pending_conn_max_len = shard->mset_pending_conn_len;
+    c->pending_queued = true;
+  }
+  return 0;
+}
+
+void mset_pending_conn_drain(struct reactor *r, uint32_t budget) {
+  if (!r || !r->shard || budget == 0)
+    return;
+  struct shard *shard = r->shard;
+
+  while (budget-- > 0 &&
+         shard->mset_inflight < shard->mset_max_concurrent &&
+         shard->mset_pending_conn_head) {
+    struct net_conn *c = shard->mset_pending_conn_head;
+    shard->mset_pending_conn_head = c->pending_next;
+    if (!shard->mset_pending_conn_head)
+      shard->mset_pending_conn_tail = NULL;
+    if (shard->mset_pending_conn_len > 0)
+      shard->mset_pending_conn_len--;
+    c->pending_next = NULL;
+    c->pending_queued = false;
+
+    if (c->state == CONN_DEAD ||
+        c->pending_reason != CONN_PENDING_MSET_BP) {
+      mset_pending_state_free(shard, c);
+      continue;
+    }
+
+    uint32_t pipeline_idx = c->pending_pipeline_idx;
+    uint32_t argc = c->pending_argc;
+    char **argv = c->pending_argv;
+    size_t *arglen = c->pending_arglen;
+    struct net_buf *req_nb = c->pending_req_nb;
+    c->pending_reason = CONN_PENDING_NONE;
+    c->pending_pipeline_idx = 0;
+    c->pending_argc = 0;
+    c->pending_argv = NULL;
+    c->pending_arglen = NULL;
+    c->pending_req_nb = NULL;
+
+    int rc = mset_coordinator_dispatch_argv(r, c, pipeline_idx, argc, argv,
+                                            arglen, req_nb);
+    shard->mset_pending_conn_resumed++;
+
+    if (argv)
+      slab_obj_free(shard->pool, argv);
+    if (arglen)
+      slab_obj_free(shard->pool, arglen);
+    if (req_nb)
+      net_buf_unref(shard->pool, req_nb);
+
+    if (rc < 0 && c->proxy.slots && c->proxy.cap) {
+      struct net_pipeline_slot *ps =
+          &c->proxy.slots[pipeline_idx & (c->proxy.cap - 1)];
+      ps->reply_type = REPLY_TYPE_ERR;
+      ps->reply_data = (uint8_t *)"OOM";
+      ps->reply_len = 3;
+      ps->state = PSLOT_LOCAL;
+    }
+
+    if (shard->mark_conn_dirty_cb)
+      shard->mark_conn_dirty_cb(shard->mark_conn_dirty_ctx, c,
+                                rc < 0 ? "mset_pending_oom"
+                                       : "mset_pending_resume");
+  }
+}
+
 /* ── Coordinator: dispatch MSET ──────────────────────────────────────── */
 
 int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
                               struct resp_parser *p, uint32_t pipeline_seq) {
+  if (r->shard->mset_inflight >= r->shard->mset_max_concurrent) {
+    if (mset_pending_conn_enqueue(r, c, p, pipeline_seq) < 0)
+      return -1;
+    return 1;
+  }
+  return mset_coordinator_dispatch_argv(r, c, pipeline_seq, p->argc_got,
+                                        p->argv, p->arglen, c->rbuf_nb);
+}
+
+static int mset_coordinator_dispatch_argv(struct reactor *r,
+                                          struct net_conn *c,
+                                          uint32_t pipeline_seq,
+                                          uint32_t argc,
+                                          char **argv,
+                                          size_t *arglen,
+                                          struct net_buf *req_nb) {
   uint64_t start_cycles = cycles_now();
-  uint32_t npairs = (uint32_t)(p->argc_got - 1) / 2;
+  uint32_t npairs = (uint32_t)(argc - 1) / 2;
   uint32_t my_id = r->shard->id;
   uint32_t nshards = r->engine->num_shards;
   struct shard_engine *engine = r->engine;
   struct slab_allocator *pool = r->shard->pool;
-  struct net_buf *nb = c->rbuf_nb;
-
-  /* Back-pressure: spin until in-flight MSET count drops below the limit.
-   * While waiting, drain our inbox so ACKs/FIN_ACKs keep flowing and
-   * the inflight counter can actually decrease. */
-  uint64_t t_bp = cycles_now();
-  uint64_t bp_spins = 0;
-  uint64_t bp_drain_calls = 0;
-  while (r->shard->mset_inflight >= r->shard->mset_max_concurrent) {
-    shard_msg_drain(engine, r->shard, r->shard->proxy_cb, r);
-    bp_drain_calls++;
-    mset_debug_progress(r->shard, now_ms(), "backpressure");
-    mset_debug_backpressure(r, c, now_ms());
-    bp_spins++;
-    __builtin_ia32_pause();
-  }
-  if (mixed_profile_enabled()) {
-    uint64_t bp_cycles = cycles_now() - t_bp;
-    uint64_t slow = mixed_profile_slow_cycles();
-    if (bp_cycles >= slow || bp_spins > 0) {
-      fprintf(stderr,
-              "[MSET_BACKPRESSURE_PROFILE] shard=%u pidx=%u waitcy=%lu "
-              "spins=%lu drain_calls=%lu inflight_after=%u max=%u\n",
-              r->shard->id, pipeline_seq, (unsigned long)bp_cycles,
-              (unsigned long)bp_spins, (unsigned long)bp_drain_calls,
-              r->shard->mset_inflight, r->shard->mset_max_concurrent);
-    }
-  }
-  PROF_RECORD(r->shard->prof.coord_backpressure_wait, t_bp);
+  struct net_buf *nb = req_nb;
   r->shard->mset_inflight++;
 
   /* Protect the request buffer against Use-After-Free.
@@ -1923,6 +2092,7 @@ int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
   if (!stat) {
     if (nb)
       net_buf_unref(pool, nb);
+    r->shard->mset_inflight--;
     return -1;
   }
 
@@ -1958,9 +2128,9 @@ int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
 
   /* Hold a ref on the input buffer until all PREPARE memcpy's are done.
    * Released in stat_free (via mset_run_fin or mset_on_fin_ack). */
-  stat->coord_rbuf_nb = c->rbuf_nb;
-  if (c->rbuf_nb)
-    net_buf_ref(c->rbuf_nb);
+  stat->coord_rbuf_nb = req_nb;
+  if (req_nb)
+    net_buf_ref(req_nb);
 
   /* Store stat in pipeline slot for ACK handler retrieval */
   struct net_pipeline_slot *ps =
@@ -1983,7 +2153,8 @@ int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
   /* ── Pass 1: count remote keys per shard ── */
   for (uint32_t i = 0; i < npairs; i++) {
     uint64_t t1 = cycles_now();
-    uint32_t target = shard_for_key(p->argv[1 + i * 2], p->arglen[1 + i * 2], nshards);
+    uint32_t target =
+        shard_for_key(argv[1 + i * 2], arglen[1 + i * 2], nshards);
     PROF_RECORD(r->shard->prof.coord_hash, t1);
     if (target != my_id)
       counts[target]++;
@@ -2011,10 +2182,10 @@ int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
 
   /* ── Pass 2: local keys inline, remote keys fill batch entries ── */
   for (uint32_t i = 0; i < npairs; i++) {
-    const char *key = p->argv[1 + i * 2];
-    size_t klen     = p->arglen[1 + i * 2];
-    const char *val = p->argv[2 + i * 2];
-    size_t vlen     = p->arglen[2 + i * 2];
+    const char *key = argv[1 + i * 2];
+    size_t klen     = arglen[1 + i * 2];
+    const char *val = argv[2 + i * 2];
+    size_t vlen     = arglen[2 + i * 2];
     uint32_t target = shard_for_key(key, klen, nshards);
 
     if (target == my_id) {
@@ -2029,7 +2200,7 @@ int mset_coordinator_dispatch(struct reactor *r, struct net_conn *c,
           .key_len         = (uint32_t)klen,
           .val_ptr         = (void *)val,
           .val_len         = (uint32_t)vlen,
-          .req_nb          = c->rbuf_nb,
+          .req_nb          = req_nb,
           .reply_int       = (int64_t)txn_ts,
           .kv_obj_ptr      = stat,
       };

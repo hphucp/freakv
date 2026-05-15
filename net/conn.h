@@ -27,6 +27,11 @@ enum net_state {
       2, /* Hard error (ERR/HUP). FD closed, waiting for pipeline drain. */
 };
 
+enum conn_pending_reason {
+  CONN_PENDING_NONE = 0,
+  CONN_PENDING_MSET_BP = 1,
+};
+
 /* ── struct net_buf ────────────────────────────────────────────────── */
 struct net_buf {
   atomic_uint refcount;
@@ -139,6 +144,17 @@ struct net_conn {
   struct net_conn *next;
   struct net_conn *prev;
   uint8_t list_type; /* 0: None, 1: Dirty, 2: Dead */
+
+  /* Connection-level scheduling pause.  When non-NONE, the reactor must not
+   * parse further requests from this connection until the owner clears it. */
+  enum conn_pending_reason pending_reason;
+  bool pending_queued;
+  struct net_conn *pending_next;
+  uint32_t pending_pipeline_idx;
+  struct net_buf *pending_req_nb;
+  uint32_t pending_argc;
+  char **pending_argv;
+  size_t *pending_arglen;
 
   /* Allocator for buffers */
   struct slab_allocator *allocator;

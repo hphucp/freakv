@@ -1068,7 +1068,7 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
      * so kv_obj_ptr is NOT overwritten. Verify here for safety. */
     /* Async MSET dispatched */
 
-    return 1;  /* PSLOT_PENDING — caller must NOT touch slot state */
+    return rc == 1 ? 3 : 1;  /* 3: connection-level pending */
   }
 
   if (strcmp(cmd, "DEL") == 0) {
@@ -1335,6 +1335,10 @@ static void handle_read_resp(struct reactor *r, struct net_conn *c) {
           }
         } else if (ret == 2) {
           /* Fast-path local command (zero-malloc proxy_exec) finished */
+        } else if (ret == 3) {
+          resp_parser_reset(c);
+          net_reactor_mark_dirty(r, c);
+          return;
         } else if (ret < 0) {
           net_reactor_mark_dead(r, c);
           return;
