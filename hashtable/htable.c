@@ -415,6 +415,30 @@ struct kv_obj *ht_bucket_take(struct hash_table *ht, const void *key,
   return obj;
 }
 
+struct kv_obj *ht_bucket_take_if_unlocked(struct hash_table *ht,
+                                          const void *key, size_t klen,
+                                          enum val_type type,
+                                          struct kv_obj *expected_obj,
+                                          bool *locked_out) {
+  if (locked_out)
+    *locked_out = false;
+
+  uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), type);
+  struct bucket *prev = NULL;
+  struct bucket *cur = ht_key_lookup(ht, meta, key, klen, &prev);
+  if (!cur || cur->obj != expected_obj)
+    return NULL;
+  if (ht_meta_is_locked(cur->meta)) {
+    if (locked_out)
+      *locked_out = true;
+    return NULL;
+  }
+
+  struct kv_obj *obj = cur->obj;
+  ht_bucket_node_unlink(ht, prev, cur);
+  return obj;
+}
+
 bool ht_bucket_delete(struct hash_table *ht, const void *key, size_t klen,
                       enum val_type type) {
   uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), type);

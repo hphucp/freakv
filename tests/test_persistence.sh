@@ -158,7 +158,26 @@ done
 assert_eq "100 cross-shard keys all restored" "100" "$ok"
 
 # ════════════════════════════════════════════════════════════════════
-section "9  SIGKILL (unclean shutdown) recovery from last good snapshot"
+section "9  MSET persistence: multi-key write and overwrite restored"
+# ════════════════════════════════════════════════════════════════════
+
+stop_server; rm -f "$SNAP_DIR"/*.fsnap; _start_with_snap
+
+$CLI MSET mset:p:1 v1 mset:p:2 v2 mset:p:3 v3 >/dev/null
+$CLI MSET mset:p:2 v2_new mset:p:4 v4 >/dev/null
+
+_wait_snap; stop_server; _start_with_snap
+
+mapfile -t mset_got < <($CLI MGET mset:p:1 mset:p:2 mset:p:3 mset:p:4)
+mset_ok=0
+[[ "${mset_got[0]}" == "v1" ]] && mset_ok=$((mset_ok + 1))
+[[ "${mset_got[1]}" == "v2_new" ]] && mset_ok=$((mset_ok + 1))
+[[ "${mset_got[2]}" == "v3" ]] && mset_ok=$((mset_ok + 1))
+[[ "${mset_got[3]}" == "v4" ]] && mset_ok=$((mset_ok + 1))
+assert_eq "MSET keys restored with latest values" "4" "$mset_ok"
+
+# ════════════════════════════════════════════════════════════════════
+section "10  SIGKILL (unclean shutdown) recovery from last good snapshot"
 # ════════════════════════════════════════════════════════════════════
 
 stop_server; rm -f "$SNAP_DIR"/*.fsnap; _start_with_snap
@@ -189,7 +208,7 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════
-section "10  Snapshot file integrity: files are non-empty"
+section "11  Snapshot file integrity: files are non-empty"
 # ════════════════════════════════════════════════════════════════════
 
 for f in "$SNAP_DIR"/*.fsnap; do

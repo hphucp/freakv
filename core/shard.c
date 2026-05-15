@@ -391,16 +391,13 @@ int shard_ttl_drain(struct shard *s, uint64_t net_time_ms_get, int max_work) {
     if (!o)
       break;
 
-    /* Skip keys locked by MSET — re-push with same TTL */
-    uint64_t meta =
-        ht_meta_pack(ht_key_hash(obj_key_get(o), o->key_len), VAL_TYPE_STRING);
-    if (ht_meta_is_locked(meta)) {
+    bool locked = false;
+    struct kv_obj *taken = ht_bucket_take_if_unlocked(
+        s->table, obj_key_get(o), o->key_len, VAL_TYPE_STRING, o, &locked);
+    if (locked) {
       ttl_index_node_push(idx, o, expire_ms);
       continue;
     }
-
-    struct kv_obj *taken =
-        ht_bucket_take(s->table, obj_key_get(o), o->key_len, VAL_TYPE_STRING);
     if (taken) {
       obj_destroy(s, taken);
       expired++;
@@ -1411,12 +1408,16 @@ bool shard_mem_evict(struct shard *s, size_t size_req) {
           victim = s->lru_tail[p];
       if (!victim)
         break;
-      struct kv_obj *taken = ht_bucket_take(s->table, obj_key_get(victim),
-                                            victim->key_len, VAL_TYPE_STRING);
+      bool locked = false;
+      struct kv_obj *taken = ht_bucket_take_if_unlocked(
+          s->table, obj_key_get(victim), victim->key_len, VAL_TYPE_STRING,
+          victim, &locked);
       if (taken) {
         shard_obj_destroy(s, taken);
         evicted_any = true;
         total_evicted++;
+      } else if (locked) {
+        lru_node_prepend(s, victim);
       } else {
         lru_node_remove(s, victim);
       }

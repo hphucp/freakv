@@ -229,6 +229,15 @@ bool ht_bucket_is_locked(struct hash_table *ht, const void *key, size_t klen,
 struct kv_obj *ht_bucket_take(struct hash_table *ht, const void *key,
                               size_t klen, enum val_type type);
 
+/* ht_bucket_take_if_unlocked — remove only if the bucket is unlocked and still
+ * points at expected_obj.  If locked_out is non-NULL it is set when the matching
+ * bucket exists but is locked. */
+struct kv_obj *ht_bucket_take_if_unlocked(struct hash_table *ht,
+                                          const void *key, size_t klen,
+                                          enum val_type type,
+                                          struct kv_obj *expected_obj,
+                                          bool *locked_out);
+
 /* ht_bucket_delete — remove and discard obj. */
 bool ht_bucket_delete(struct hash_table *ht, const void *key, size_t klen,
                       enum val_type type);
