@@ -81,8 +81,9 @@ bool mem_lib_init(uint32_t n_threads, size_t per_thread_hint) {
     per_thread_meta_size = 16ULL * 1024 * 1024; /* Minimum 16MB */
   }
 
-  /* Linear arena: 128MB per thread for HT/OVF */
-  size_t per_thread_arena_size = 128ULL * 1024 * 1024;
+  /* Linear arena: 2^32 bucket slots per shard, split by the hash table into
+   * main-table and overflow arenas. This is VA only (MAP_NORESERVE). */
+  size_t per_thread_arena_size = ARENA_LINEAR_RESERVE;
 
   /* 3. Reserve VA regions using mmap PROT_NONE */
   size_t total_data = per_thread_data_size * n_threads;

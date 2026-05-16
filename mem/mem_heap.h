@@ -27,6 +27,7 @@ struct thread_heap {
   char *data_base;       /* Start of this thread's data slice */
   size_t data_reserved;  /* Total VA reserved (per_thread_data_size) */
   size_t data_committed; /* Physical memory committed (in bytes) */
+  size_t linear_committed; /* Physical memory committed for HT/OVF arenas */
 
   /* Metadata pointers (in separate VA region) */
   struct page_info *pages;        /* page_info array in meta_base */

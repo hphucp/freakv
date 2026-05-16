@@ -133,6 +133,9 @@ long long shard_key_ttl(struct shard *s, const void *key, size_t klen,
 uint64_t shard_key_expire_get(struct shard *s, const void *key, size_t klen);
 struct kv_obj *shard_obj_put(struct shard *s, struct kv_obj *obj,
                              enum val_type type, uint64_t expire_ms);
+struct kv_obj *shard_bucket_put(struct shard *s, struct kv_obj *obj,
+                                enum val_type type, uint64_t expire_ms,
+                                uint32_t put_flags);
 
 /* ── TTL active expiry ────────────────────────────────────────────────── */
 

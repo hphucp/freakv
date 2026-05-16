@@ -1082,7 +1082,7 @@ static struct mset_stat *mset_fin_one_cmd(struct shard_engine *engine,
     if (current_in_ht != new_obj) {
       uint64_t t_put = cycles_now();
       struct kv_obj *replaced =
-          ht_bucket_put(shard->table, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
+          shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
       PROF_RECORD(shard->prof.ht_put_internal, t_put);
       (void)replaced;
 
@@ -1552,7 +1552,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
     /* Tentative HT insert: makes key visible under the lock */
     uint64_t t_ins = cycles_now();
     struct kv_obj *replaced =
-        ht_bucket_put(shard->table, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
+        shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
     PROF_RECORD(shard->prof.ht_insert, t_ins);
     if (replaced == (struct kv_obj *)(uintptr_t)-1) {
       /* HT full */
@@ -1596,7 +1596,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
       /* For new keys: old_new_obj is the tentative in HT.
        * Swap our new_obj in so FIN finds the right object. */
       if (incumbent->old_obj == NULL) {
-        ht_bucket_put(shard->table, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
+        shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
         le->obj_ptr = new_obj;
       }
 
@@ -1631,7 +1631,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
           if (tentative == old_tentative)
             old_tentative = NULL;
         }
-        ht_bucket_put(shard->table, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
+        shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
         if (new_obj->expire_ms && new_obj->heap_idx == HEAP_IDX_NONE)
           ttl_index_node_push(&shard->ttl_idx, new_obj, new_obj->expire_ms);
       }
@@ -1738,7 +1738,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
           cmd->old_obj = lock_key;
         } else {
           /* Key absent from HT (defensive) — insert tentative */
-          ht_bucket_put(shard->table, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
+          shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
           if (new_obj->expire_ms)
             ttl_index_node_push(&shard->ttl_idx, new_obj, new_obj->expire_ms);
           lock_key = new_obj;

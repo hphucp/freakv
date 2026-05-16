@@ -24,6 +24,7 @@ bool thread_heap_init(struct thread_heap *heap, uint32_t thread_id) {
   heap->data_base = (char *)thread_data_base(thread_id);
   heap->data_reserved = g_mem_arena.per_thread_data_size;
   heap->data_committed = 0;
+  heap->linear_committed = 0;
   heap->meta_committed = 0; /* Bug 5 fix: initialize meta_committed */
 
   /* Metadata pointers (in separate VA region) */
@@ -103,24 +104,11 @@ bool mem_data_grow(struct thread_heap *heap, size_t new_committed) {
   }
 
   /* Check memory limit */
-  if (heap->limit_bytes > 0 && new_committed > heap->limit_bytes) {
-    /* Try eviction */
-    if (heap->evict_fn) {
-      size_t bytes_needed = new_committed - heap->data_committed;
-      size_t freed = heap->evict_fn(heap->evict_ctx, bytes_needed);
-      if (freed < bytes_needed) {
-        fprintf(stderr,
-                "[mem_heap] OOM: limit=%zu current=%zu needed=%zu freed=%zu\n",
-                heap->limit_bytes, heap->data_committed, bytes_needed, freed);
-        return false;
-      }
-    } else {
-      fprintf(
-          stderr,
-          "[mem_heap] OOM: limit=%zu requested=%zu (no eviction callback)\n",
-          heap->limit_bytes, new_committed);
-      return false;
-    }
+  if (heap->limit_bytes > 0 &&
+      heap->linear_committed + new_committed > heap->limit_bytes) {
+    fprintf(stderr, "[mem_heap] OOM: limit=%zu requested=%zu linear=%zu\n",
+            heap->limit_bytes, new_committed, heap->linear_committed);
+    return false;
   }
 
   /* Align to HPAGE boundary */
@@ -320,5 +308,6 @@ size_t mem_usage_get(uint32_t thread_id) {
     return 0;
   }
 
-  return g_thread_heaps[thread_id].data_committed;
+  return g_thread_heaps[thread_id].data_committed +
+         g_thread_heaps[thread_id].linear_committed;
 }

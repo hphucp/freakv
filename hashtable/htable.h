@@ -149,7 +149,7 @@ _Static_assert(offsetof(struct bucket, next) == 24, "");
 /* ── struct hash_table
  * ────────────────────────────────────────────────────────── */
 
-#define HT_LOAD_MAX 0.75
+#define HT_LOAD_MAX 1.2
 #define HT_OVF_RATIO 8
 #define HT_MIN_BUCKETS 16
 #define HT_REHASH_STEP 64
@@ -160,6 +160,7 @@ struct hash_table {
   size_t old_cap;
   size_t used;
   int64_t rehash_idx; /* -1 = idle */
+  bool rehash_disabled;
 
   struct bucket *ovf_pool;
   uint32_t ovf_pool_cap;
@@ -230,8 +231,8 @@ struct kv_obj *ht_bucket_take(struct hash_table *ht, const void *key,
                               size_t klen, enum val_type type);
 
 /* ht_bucket_take_if_unlocked — remove only if the bucket is unlocked and still
- * points at expected_obj.  If locked_out is non-NULL it is set when the matching
- * bucket exists but is locked. */
+ * points at expected_obj.  If locked_out is non-NULL it is set when the
+ * matching bucket exists but is locked. */
 struct kv_obj *ht_bucket_take_if_unlocked(struct hash_table *ht,
                                           const void *key, size_t klen,
                                           enum val_type type,

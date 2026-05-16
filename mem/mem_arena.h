@@ -16,10 +16,11 @@
 
 /* ── VA reservation sizes ────────────────────────────────────────────── */
 
-#define ARENA_DATA_RESERVE (1ULL << 40)     /* 1TB total for data */
-#define ARENA_META_RESERVE (64ULL << 30)    /* 64GB total for metadata */
-#define ARENA_LINEAR_RESERVE (128ULL << 30) /* 128GB total for linear arenas   \
-                                             */
+#define ARENA_DATA_RESERVE (1ULL << 40)  /* 1TB total for data */
+#define ARENA_META_RESERVE (64ULL << 30) /* 64GB total for metadata */
+/* 2^32 bucket slots * 32 bytes. This is reserved per shard with
+ * MAP_NORESERVE; physical pages are committed only as the HT/OVF arenas grow. */
+#define ARENA_LINEAR_RESERVE (1ULL << 37) /* 128GiB per linear arena slice */
 
 /* ── Global VA layout ────────────────────────────────────────────────── */
 

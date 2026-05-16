@@ -20,18 +20,21 @@ static inline size_t ht_pow2_next(size_t n) {
   return n + 1;
 }
 
-static void ht_buckets_clear(struct bucket *b, size_t n) {
-  memset(b, 0, n * sizeof(struct bucket));
-}
-
 /* ── Overflow pool ────────────────────────────────────────────────────── */
 
 static struct bucket *ht_ovf_bucket_alloc(struct hash_table *ht) {
   if (!ht->ovf_free) {
     uint32_t old = ht->ovf_pool_cap;
-    uint32_t newcap = old ? old * 2 : 16;
-    if (newcap > 1024 * 1024 * 64)
-      newcap = 1024 * 1024 * 64; /* Limit growth */
+    size_t maxcap = ht->ovf_arena.reserved / sizeof(struct bucket);
+    if ((size_t)old >= maxcap)
+      return NULL;
+
+    size_t newcap_sz = old ? (size_t)old * 2 : 16;
+    if (newcap_sz > maxcap)
+      newcap_sz = maxcap;
+    if (newcap_sz > UINT32_MAX)
+      return NULL;
+    uint32_t newcap = (uint32_t)newcap_sz;
 
     size_t new_total_bytes = (size_t)newcap * sizeof(struct bucket);
     if (!linear_arena_grow(&ht->ovf_arena, new_total_bytes))
@@ -161,12 +164,12 @@ struct hash_table *ht_table_create(struct thread_heap *heap, uint32_t thread_id,
   ht->old_cap = 0;
   ht->used = 0;
   ht->rehash_idx = -1;
+  ht->rehash_disabled = false;
   ht->ovf_pool = (struct bucket *)linear_arena_base(&ht->ovf_arena);
   ht->ovf_pool_cap = ovf_cap;
   ht->ovf_free = NULL;
   ht->heap = heap;
 
-  ht_buckets_clear(ht->buckets, initial_cap);
   ht_ovf_pool_init(ht);
 
   return ht;
@@ -179,7 +182,7 @@ fail:
 void ht_table_destroy(struct hash_table *ht) {
   if (!ht)
     return;
-  size_t total = ht->old_cap ? ht->old_cap + ht->cap : ht->cap;
+  size_t total = ht->cap;
   for (size_t i = 0; i < total; i++) {
     struct bucket *b = &ht->buckets[i];
     while (b && !ht_meta_empty(b->meta)) {
@@ -194,11 +197,10 @@ void ht_table_destroy(struct hash_table *ht) {
 
 static bool ht_rehash_start(struct hash_table *ht) {
   size_t old_cap = ht->cap, new_cap = old_cap * 2;
-  size_t new_total_bytes = (old_cap + new_cap) * sizeof(struct bucket);
+  size_t new_total_bytes = new_cap * sizeof(struct bucket);
   if (!linear_arena_grow(&ht->ht_arena, new_total_bytes))
     return false;
   ht->buckets = (struct bucket *)linear_arena_base(&ht->ht_arena);
-  ht_buckets_clear(ht->buckets + old_cap, old_cap);
   ht->old_cap = old_cap;
   ht->cap = new_cap;
   ht->rehash_idx = 0;
@@ -318,8 +320,11 @@ struct kv_obj *ht_bucket_put(struct hash_table *ht, struct kv_obj *obj,
 
   if (ht->rehash_idx >= 0)
     ht_rehash_tick(ht);
-  if (ht->rehash_idx < 0 && (double)ht->used / (double)ht->cap > HT_LOAD_MAX)
-    ht_rehash_start(ht);
+  if (!ht->rehash_disabled && ht->rehash_idx < 0 &&
+      (double)ht->used / (double)ht->cap > HT_LOAD_MAX) {
+    if (!ht_rehash_start(ht))
+      ht->rehash_disabled = true;
+  }
 
   uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), type);
   struct bucket *found = ht_key_lookup(ht, meta, key, klen, NULL);

@@ -218,6 +218,17 @@ static inline void obj_destroy(struct shard *s, struct kv_obj *o) {
 
 /* ── Hot-path ops ─────────────────────────────────────────────────────── */
 
+struct kv_obj *shard_bucket_put(struct shard *s, struct kv_obj *obj,
+                                enum val_type type, uint64_t expire_ms,
+                                uint32_t put_flags) {
+  struct kv_obj *old =
+      ht_bucket_put(s->table, obj, type, expire_ms, put_flags);
+  if (old == (struct kv_obj *)(uintptr_t)-1 && shard_mem_evict(s, 0)) {
+    old = ht_bucket_put(s->table, obj, type, expire_ms, put_flags);
+  }
+  return old;
+}
+
 bool shard_key_set(struct shard *s, const void *key, size_t klen,
                    const char *val, size_t vlen, uint64_t expire_ms,
                    uint32_t put_flags) {
@@ -269,16 +280,21 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
     snap_obj_mark(&s->snap, s->mem, o, obj_size);
     PROF_RECORD(s->prof.mark_snap, t_m);
   }
-  lru_node_prepend(s, o);
   uint64_t t_p = cycles_now();
   struct kv_obj *old =
-      ht_bucket_put(s->table, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
+      shard_bucket_put(s, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
   PROF_RECORD(s->prof.ht_insert, t_p);
+
+  bool ok = old != (struct kv_obj *)(uintptr_t)-1;
+  if (ok)
+    lru_node_prepend(s, o);
 
   if (old && old != (struct kv_obj *)(uintptr_t)-1)
     obj_destroy(s, old);
 
-  bool ok = old != (struct kv_obj *)(uintptr_t)-1;
+  if (!ok) {
+    obj_destroy(s, o);
+  }
 
   if (ok && expire_ms > 0)
     ttl_index_node_push(&s->ttl_idx, o, expire_ms);
@@ -340,7 +356,7 @@ bool shard_key_expire(struct shard *s, const void *key, size_t klen,
   if (!o)
     return false;
 
-  ht_bucket_put(s->table, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
+  shard_bucket_put(s, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
   if (expire_ms > 0) {
     if (o->heap_idx == HEAP_IDX_NONE)
       ttl_index_node_push(&s->ttl_idx, o, expire_ms);
@@ -374,7 +390,7 @@ struct kv_obj *shard_obj_put(struct shard *s, struct kv_obj *obj,
                              enum val_type type, uint64_t expire_ms) {
   obj->expire_ms = (expire_ms == (uint64_t)-1) ? 0 : expire_ms;
   lru_node_touch(s, obj);
-  return ht_bucket_put(s->table, obj, type, expire_ms, HT_PUT_NONE);
+  return shard_bucket_put(s, obj, type, expire_ms, HT_PUT_NONE);
 }
 
 /* ── TTL active expiry ────────────────────────────────────────────────── */
@@ -1379,10 +1395,16 @@ void shard_engine_stats_print(const struct shard_engine *e) {
 }
 
 bool shard_mem_evict(struct shard *s, size_t size_req) {
-  uint32_t target_pidx =
-      size_req <= SMALL_ALLOC_MAX ? pool_idx_get(size_req) : NR_SMALL_POOLS;
+  bool force_entry_eviction = size_req == 0;
+  uint32_t target_pidx = force_entry_eviction
+                             ? NR_SMALL_POOLS
+                             : (size_req <= SMALL_ALLOC_MAX
+                                    ? pool_idx_get(size_req)
+                                    : NR_SMALL_POOLS);
   uint32_t buddy_pages_needed = 0;
-  if (size_req <= SMALL_ALLOC_MAX) {
+  if (force_entry_eviction) {
+    buddy_pages_needed = 0;
+  } else if (size_req <= SMALL_ALLOC_MAX) {
     struct small_pool *pool = &s->mem->pools[target_pidx];
     buddy_pages_needed =
         (pool->partial_spans || pool->empty_spans) ? 0 : pool->lpages_per_span;
@@ -1396,7 +1418,7 @@ bool shard_mem_evict(struct shard *s, size_t size_req) {
   bool soft_ok = (mem_limit == 0) || (mem_used + size_req <= mem_limit);
   bool hard_ok = (buddy_pages_needed == 0) ||
                  buddy_span_check(&s->mem->buddy, buddy_pages_needed);
-  if (soft_ok && hard_ok)
+  if (!force_entry_eviction && soft_ok && hard_ok)
     return true;
   int total_evicted = 0;
   while (true) {
@@ -1424,6 +1446,8 @@ bool shard_mem_evict(struct shard *s, size_t size_req) {
     }
     if (!evicted_any)
       return false;
+    if (force_entry_eviction)
+      return true;
     if (total_evicted >= 200) {
       pool_span_force_reclaim_all(s->mem->pools, &s->mem->buddy, s->mem->pages,
                                   &s->mem->span_meta_pool, s->mem->data_base);
