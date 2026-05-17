@@ -326,3 +326,8 @@ ops/sec, with Dragonfly showing slightly tighter tail latency at p99 and p99.9.
 
 Even with snapshots enabled every 10 seconds, FreakV maintains **10.7M SET
 ops/sec** — still higher than Dragonfly's cache-mode peak of 10.1M.
+
+### Benchmark Videos
+
+Full recordings of the benchmark sessions are available in this playlist:
+[FreakV Benchmark Playlist](https://youtube.com/playlist?list=PL6XnBQdMhrlTUyG6oRgxTeHrMVQ-e1jhN).
