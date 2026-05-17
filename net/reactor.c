@@ -47,12 +47,16 @@ static inline uint64_t net_time_ms_get(void) {
 }
 
 static bool net_mset_debug_enabled(void) {
+#if !FREAKV_MSET_DEBUG
+  return false;
+#else
   static int cached = -1;
   if (cached < 0) {
     const char *v = getenv("MSET_DEBUG_STUCK");
     cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
   }
   return cached != 0;
+#endif
 }
 
 static uint64_t net_mset_debug_slow_ms(void) {
@@ -67,12 +71,16 @@ static uint64_t net_mset_debug_slow_ms(void) {
 }
 
 static bool net_mset_transport_debug_enabled(void) {
+#if !FREAKV_MSET_DEBUG
+  return false;
+#else
   static int cached = -1;
   if (cached < 0) {
     const char *v = getenv("MSET_DEBUG_TRANSPORT");
     cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
   }
   return cached != 0;
+#endif
 }
 
 static uint64_t net_mset_transport_interval_ms(void) {
@@ -97,6 +105,7 @@ static void net_mset_dirty_summary(struct net_conn *c, uint64_t cur_ms,
   *pending = 0;
   *first_seq = 0;
   *max_ready_age = 0;
+#if FREAKV_MSET_DEBUG
   if (!c || !c->proxy.slots)
     return;
 
@@ -116,11 +125,16 @@ static void net_mset_dirty_summary(struct net_conn *c, uint64_t cur_ms,
       (*pending)++;
     }
   }
+#else
+  (void)c;
+  (void)cur_ms;
+#endif
 }
 
 static void net_mset_log_dirty_event(struct reactor *r, struct net_conn *c,
                                      const char *event, const char *reason,
                                      uint64_t cur_ms) {
+#if FREAKV_MSET_DEBUG
   if (!net_mset_debug_enabled() || !net_mset_transport_debug_enabled() || !c)
     return;
 
@@ -143,6 +157,13 @@ static void net_mset_log_dirty_event(struct reactor *r, struct net_conn *c,
           c->debug_mset_dirty_mark_ms && cur_ms >= c->debug_mset_dirty_mark_ms
               ? (unsigned long)(cur_ms - c->debug_mset_dirty_mark_ms)
               : 0UL);
+#else
+  (void)r;
+  (void)c;
+  (void)event;
+  (void)reason;
+  (void)cur_ms;
+#endif
 }
 
 /* ── struct net_conn lifecycle ───────────────────────────────────────── */
@@ -231,7 +252,9 @@ static inline void net_reactor_mark_dirty_reason(struct reactor *r,
     r->dirty_head->prev = c;
   r->dirty_head = c;
   c->list_type = 1;
+#if FREAKV_MSET_DEBUG
   c->debug_mset_dirty_mark_ms = cur_ms;
+#endif
   net_mset_log_dirty_event(r, c, "mark", reason, cur_ms);
 }
 
@@ -622,6 +645,7 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
         write(c->fd, c->wbuf + c->wbuf_sent, c->wbuf_len - c->wbuf_sent);
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#if FREAKV_MSET_DEBUG
         if (net_mset_debug_enabled() && c->debug_mset_wbuf_replies > 0) {
           uint64_t cur_ms = net_time_ms_get();
           if (net_mset_transport_debug_enabled() ||
@@ -637,6 +661,7 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
                     c->wbuf_sent, c->wbuf_len, c->proxy.out, c->proxy.in);
           }
         }
+#endif
         /* Socket buffer full: must wait for Master Flush or next EPOLLOUT */
         net_reactor_mark_dirty_reason(r, c, "socket_eagain");
         return;
@@ -648,6 +673,7 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
     size_t before_sent = c->wbuf_sent;
     size_t before_remaining = c->wbuf_len - c->wbuf_sent;
     c->wbuf_sent += (size_t)n;
+#if FREAKV_MSET_DEBUG
     if (net_mset_debug_enabled() && c->debug_mset_wbuf_replies > 0 &&
         c->wbuf_sent >= c->wbuf_len) {
       uint64_t cur_ms = net_time_ms_get();
@@ -693,6 +719,7 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
         c->debug_mset_last_transport_log_ms = cur_ms;
       }
     }
+#endif
   }
 }
 
@@ -717,6 +744,7 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
     /* Stop at first incomplete slot (head-of-line, but per-slot not per-batch)
      */
     if (s->state != PSLOT_LOCAL && s->state != PSLOT_DONE) {
+#if FREAKV_MSET_DEBUG
       if (net_mset_debug_enabled() &&
           s->parent_cmd_id == MSG_CMD_MSET_PART &&
           (s->kv_obj_ptr || s->debug_mset_stat)) {
@@ -745,9 +773,11 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
                   r->shard->mset_inflight, c->wbuf_len);
         }
       }
+#endif
       break;
     }
 
+#if FREAKV_MSET_DEBUG
     if (net_mset_debug_enabled() && s->parent_cmd_id == MSG_CMD_MSET_PART) {
       if (!cur_ms)
         cur_ms = net_time_ms_get();
@@ -765,6 +795,7 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
       if (ready_age_ms > max_mset_ready_age)
         max_mset_ready_age = ready_age_ms;
     }
+#endif
 
     /* Serialize reply into wbuf */
     net_slot_write_to_wbuf(r, c, s);
@@ -774,6 +805,7 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
     pp->out++;
   }
 
+#if FREAKV_MSET_DEBUG
   if (net_mset_debug_enabled() && flushed_mset > 0) {
     c->debug_mset_wbuf_replies += flushed_mset;
     if (max_mset_age > c->debug_mset_wbuf_max_age)
@@ -800,6 +832,7 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
       c->debug_mset_last_transport_log_ms = log_ms;
     }
   }
+#endif
 }
 
 // Move resp_handler.h to top

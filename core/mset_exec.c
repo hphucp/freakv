@@ -33,11 +33,26 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
                                           size_t *arglen,
                                           struct net_buf *req_nb);
 
+#if FREAKV_MSET_DEBUG
+#define MSET_DBG_STORE(slot, value)                                            \
+  atomic_store_explicit(&(slot), (value), memory_order_relaxed)
+#define MSET_DBG_INIT(slot, value) atomic_init(&(slot), (value))
+#else
+#define MSET_DBG_STORE(slot, value)                                            \
+  do {                                                                         \
+  } while (0)
+#define MSET_DBG_INIT(slot, value)                                             \
+  do {                                                                         \
+  } while (0)
+#endif
+
 /* ── Low-level helpers ───────────────────────────────────────────────── */
 
 static inline void send_to_shard(struct shard_engine *engine, uint32_t from,
                                  uint32_t to, struct spsc_message *msg) {
-  msg->sent_cycles = cycles_now();
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+  msg->sent_cycles = PROF_NOW();
+#endif
   struct spsc_queue *q = &engine->queues[from * engine->num_shards + to];
   while (!spsc_queue_push(q, msg))
     sched_yield();
@@ -54,21 +69,29 @@ static inline uint64_t now_ms(void) {
 }
 
 static bool mset_debug_enabled(void) {
+#if !FREAKV_MSET_DEBUG
+  return false;
+#else
   static int cached = -1;
   if (cached < 0) {
     const char *v = getenv("MSET_DEBUG_STUCK");
     cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
   }
   return cached != 0;
+#endif
 }
 
 static bool mixed_profile_enabled(void) {
+#if !FREAKV_MIXED_PROFILE
+  return false;
+#else
   static int cached = -1;
   if (cached < 0) {
     const char *v = getenv("MSET_MIXED_PROFILE");
     cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
   }
   return cached != 0;
+#endif
 }
 
 static uint64_t mixed_profile_slow_cycles(void) {
@@ -142,9 +165,15 @@ static uint64_t mset_debug_slow_ms(void) {
 }
 
 static uint64_t mset_stat_age_ms(struct mset_stat *stat, uint64_t cur_ms) {
+#if FREAKV_MSET_DEBUG
   return stat && stat->start_ms && cur_ms >= stat->start_ms
              ? cur_ms - stat->start_ms
              : 0;
+#else
+  (void)stat;
+  (void)cur_ms;
+  return 0;
+#endif
 }
 
 static uint32_t mset_debug_count_local_heads(struct mset_stat *stat,
@@ -160,6 +189,7 @@ static uint32_t mset_debug_count_local_heads(struct mset_stat *stat,
 
 static void mset_debug_dump_stat(struct shard *shard, struct mset_stat *stat,
                                  uint64_t cur_ms, const char *where) {
+#if FREAKV_MSET_DEBUG
   if (!mset_debug_enabled() || !stat)
     return;
 
@@ -216,11 +246,18 @@ static void mset_debug_dump_stat(struct shard *shard, struct mset_stat *stat,
             (unsigned long)cmd->hash56, le ? (void *)le->queue_head : NULL,
             le ? (void *)le->queue_tail : NULL);
   }
+#else
+  (void)shard;
+  (void)stat;
+  (void)cur_ms;
+  (void)where;
+#endif
 }
 
 static __attribute__((unused)) void
 mset_debug_backpressure(struct reactor *r, struct net_conn *c,
                         uint64_t cur_ms) {
+#if FREAKV_MSET_DEBUG && FREAKV_PROFILE
   struct shard *shard = r->shard;
   if (!mset_debug_enabled())
     return;
@@ -306,10 +343,16 @@ mset_debug_backpressure(struct reactor *r, struct net_conn *c,
     mset_debug_dump_stat(shard, stat, cur_ms,
                          "backpressure");
   }
+#else
+  (void)r;
+  (void)c;
+  (void)cur_ms;
+#endif
 }
 
 static void mset_debug_progress(struct shard *shard, uint64_t cur_ms,
                                 const char *where) {
+#if FREAKV_MSET_DEBUG && FREAKV_PROFILE
   if (!mset_debug_enabled())
     return;
 
@@ -340,11 +383,17 @@ static void mset_debug_progress(struct shard *shard, uint64_t cur_ms,
   } else if (!complete) {
     shard->mset_debug_all_complete_logged = false;
   }
+#else
+  (void)shard;
+  (void)cur_ms;
+  (void)where;
+#endif
 }
 
 static void mset_debug_reply_ready(struct shard *shard, struct net_conn *c,
                                    struct mset_stat *stat,
                                    const char *where) {
+#if FREAKV_MSET_DEBUG
   if (!c || !stat)
     return;
   uint64_t cur_ms = now_ms();
@@ -369,6 +418,12 @@ static void mset_debug_reply_ready(struct shard *shard, struct net_conn *c,
           atomic_load_explicit(&stat->ack, memory_order_acquire),
           atomic_load_explicit(&stat->fin_ack, memory_order_acquire),
           c->proxy.out, c->proxy.in, shard->mset_inflight);
+#else
+  (void)shard;
+  (void)c;
+  (void)stat;
+  (void)where;
+#endif
 }
 
 static bool mset_set_ok_reply(struct shard *shard, struct mset_stat *stat,
@@ -564,6 +619,7 @@ static void mset_debug_lifecycle(struct shard *shard, struct mset_stat *stat,
 static void mset_debug_print_timeline(const char *tag, struct shard *shard,
                                       struct mset_stat *stat,
                                       uint64_t cur_ms) {
+#if FREAKV_MSET_DEBUG
   if (!mset_debug_enabled() || !stat)
     return;
   uint64_t start = stat->start_ms;
@@ -633,6 +689,12 @@ static void mset_debug_print_timeline(const char *tag, struct shard *shard,
           bfs_done && start ? (long long)(bfs_done - start) : -1LL,
           bfs_processed, bfs_cascade,
           mset_debug_count_local_heads(stat, shard->id));
+#else
+  (void)tag;
+  (void)shard;
+  (void)stat;
+  (void)cur_ms;
+#endif
 }
 
 static void mset_debug_cascade_event(struct shard *shard, const char *event,
@@ -642,6 +704,7 @@ static void mset_debug_cascade_event(struct shard *shard, const char *event,
                                      uint32_t local_after,
                                      uint32_t processed,
                                      uint64_t cur_ms, bool anomaly) {
+#if FREAKV_MSET_DEBUG
   if (!mset_debug_enabled() || !stat)
     return;
   bool cascade =
@@ -662,6 +725,17 @@ static void mset_debug_cascade_event(struct shard *shard, const char *event,
           atomic_load_explicit(&stat->fin_ack, memory_order_acquire),
           (void *)source, source ? source->pipeline_idx : 0, local_before,
           local_after, processed, anomaly, cascade);
+#else
+  (void)shard;
+  (void)event;
+  (void)stat;
+  (void)source;
+  (void)local_before;
+  (void)local_after;
+  (void)processed;
+  (void)cur_ms;
+  (void)anomaly;
+#endif
 }
 
 static void mset_debug_bfs_event(struct shard *shard, const char *event,
@@ -733,8 +807,7 @@ static struct mset_stat *try_send_ack(struct shard_engine *engine,
   if (prev + 1 != stat->total)
     return NULL;
 
-  atomic_store_explicit(&stat->dbg_ack_last_ms, now_ms(),
-                        memory_order_relaxed);
+  MSET_DBG_STORE(stat->dbg_ack_last_ms, now_ms());
   mset_debug_lifecycle(shard, stat,
                        stat->coordinator_id == shard->id ? "ack_last_local"
                                                          : "ack_last_remote",
@@ -787,6 +860,7 @@ static inline void stat_free_real(struct shard_engine *engine,
     }
   }
   struct net_conn *c = (struct net_conn *)stat->conn_ptr;
+#if FREAKV_MSET_DEBUG
   if (c && c->generation == stat->conn_generation && c->proxy.slots) {
     struct net_pipeline_slot *ps =
         &c->proxy.slots[stat->pipeline_idx & (c->proxy.cap - 1)];
@@ -795,6 +869,7 @@ static inline void stat_free_real(struct shard_engine *engine,
       ps->debug_mset_start_ms = 0;
     }
   }
+#endif
   shard->mset_inflight--;
   mset_debug_progress(shard, now_ms(), "stat_free");
   struct mset_batch *b = stat->batch_cleanup_head;
@@ -833,8 +908,7 @@ static void mset_send_fin_to_remotes(struct shard_engine *engine,
         .pipeline_idx = stat->pipeline_idx,
         .kv_obj_ptr = stat,
     };
-    atomic_store_explicit(&stat->dbg_send_fin_remote_ms, now_ms(),
-                          memory_order_relaxed);
+    MSET_DBG_STORE(stat->dbg_send_fin_remote_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "send_fin_remote", now_ms(), sid);
     send_to_shard(engine, my_id, sid, &fin);
     wake_mask |= (1U << sid);
@@ -866,8 +940,7 @@ static bool mset_try_early_commit(struct shard_engine *engine,
  */
 static void mset_broadcast_fin(struct shard_engine *engine, struct shard *shard,
                                struct mset_stat *stat) {
-  atomic_store_explicit(&stat->dbg_broadcast_fin_ms, now_ms(),
-                        memory_order_relaxed);
+  MSET_DBG_STORE(stat->dbg_broadcast_fin_ms, now_ms());
   mset_debug_lifecycle(shard, stat, "broadcast_fin", now_ms(), 0);
 
   if (mset_debug_enabled()) {
@@ -887,8 +960,10 @@ static void mset_broadcast_fin(struct shard_engine *engine, struct shard *shard,
   }
 
   /* Measure PREPARE phase: start_cycles → all ACKs received. */
+#if FREAKV_PROFILE
   PROF_RECORD_HIST(shard->prof.mset_prepare_rtt, shard->prof.mset_prepare_rtt_hist,
                    stat->start_cycles);
+#endif
 
   /* Detach from pipeline slot so a late mset_on_ack is a safe no-op. */
   struct net_conn *c = (struct net_conn *)stat->conn_ptr;
@@ -913,7 +988,7 @@ static struct mset_stat *mset_drain_waitqueue(struct shard_engine *engine,
                                               struct shard *shard,
                                               struct lock_entry *le,
                                               uint64_t cur_ms) {
-  uint64_t start_cycles = cycles_now();
+  uint64_t start_cycles = PROF_NOW();
 
   for (;;) {
     /* Priority 1: closed groups (sorted, head = highest priority) */
@@ -974,10 +1049,13 @@ static struct mset_stat *mset_drain_waitqueue(struct shard_engine *engine,
         }
 
         /* Regular command: execute and reply */
-        uint64_t exec_start = cycles_now();
-        uint64_t wait_cycles = ci->defer_cycles ? exec_start - ci->defer_cycles : 0;
+        uint64_t exec_start = PROF_NOW();
+        uint64_t wait_cycles = 0;
+#if FREAKV_MIXED_PROFILE
+        wait_cycles = ci->defer_cycles ? exec_start - ci->defer_cycles : 0;
+#endif
         enum proxy_exec_result exec_rc = proxy_exec(shard, &ci->msg, cur_ms);
-        uint64_t exec_cycles = cycles_now() - exec_start;
+        uint64_t exec_cycles = PROF_NOW() - exec_start;
         mset_mixed_log_set_drain(shard, ci, exec_rc, wait_cycles, exec_cycles);
         if (exec_rc == PROXY_EXEC_DONE) {
           shard->ops_completed++;
@@ -1010,10 +1088,13 @@ static struct mset_stat *mset_drain_waitqueue(struct shard_engine *engine,
       struct cmd_info *ci = og->head;
       while (ci) {
         struct cmd_info *next = ci->next;
-        uint64_t exec_start = cycles_now();
-        uint64_t wait_cycles = ci->defer_cycles ? exec_start - ci->defer_cycles : 0;
+        uint64_t exec_start = PROF_NOW();
+        uint64_t wait_cycles = 0;
+#if FREAKV_MIXED_PROFILE
+        wait_cycles = ci->defer_cycles ? exec_start - ci->defer_cycles : 0;
+#endif
         enum proxy_exec_result exec_rc = proxy_exec(shard, &ci->msg, cur_ms);
-        uint64_t exec_cycles = cycles_now() - exec_start;
+        uint64_t exec_cycles = PROF_NOW() - exec_start;
         mset_mixed_log_set_drain(shard, ci, exec_rc, wait_cycles, exec_cycles);
         if (exec_rc == PROXY_EXEC_DONE) {
           shard->ops_completed++;
@@ -1054,7 +1135,7 @@ static struct mset_stat *mset_fin_one_cmd(struct shard_engine *engine,
                                           struct shard *shard,
                                           struct cmd_info *cmd,
                                           uint64_t cur_ms) {
-  uint64_t start_cycles = cycles_now();
+  uint64_t start_cycles = PROF_NOW();
   struct lock_entry *le = cmd->le;
   struct kv_obj *new_obj = cmd->new_obj;
   uint64_t hash56 = cmd->hash56;
@@ -1080,7 +1161,7 @@ static struct mset_stat *mset_fin_one_cmd(struct shard_engine *engine,
      * in PREPARE, so we MUST swap now.
      */
     if (current_in_ht != new_obj) {
-      uint64_t t_put = cycles_now();
+      uint64_t t_put = PROF_NOW();
       struct kv_obj *replaced =
           shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
       PROF_RECORD(shard->prof.ht_put_internal, t_put);
@@ -1162,8 +1243,7 @@ static struct mset_stat *mset_fin_one_cmd(struct shard_engine *engine,
  */
 static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
                          struct mset_stat *initial_stat, uint64_t cur_ms) {
-  atomic_store_explicit(&initial_stat->dbg_run_fin_ms, cur_ms,
-                        memory_order_relaxed);
+  MSET_DBG_STORE(initial_stat->dbg_run_fin_ms, cur_ms);
   mset_debug_lifecycle(shard, initial_stat, "run_fin_start", cur_ms, 0);
 
   /* Broadcast FIN to remote participant shards for the initial stat. */
@@ -1177,15 +1257,14 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
   size_t queue_tail = 0;
 
   queue[queue_tail++] = initial_stat;
-  atomic_store_explicit(&initial_stat->dbg_bfs_enqueue_ms, cur_ms,
-                        memory_order_relaxed);
+  MSET_DBG_STORE(initial_stat->dbg_bfs_enqueue_ms, cur_ms);
 
   while (queue_head < queue_tail) {
     struct mset_stat *stat = queue[queue_head++];
     uint32_t n_processed = 0;
     uint32_t local_before =
         mset_debug_enabled() ? mset_debug_count_local_heads(stat, shard->id) : 0;
-    atomic_store_explicit(&stat->dbg_bfs_pop_ms, cur_ms, memory_order_relaxed);
+    MSET_DBG_STORE(stat->dbg_bfs_pop_ms, cur_ms);
     mset_debug_cascade_event(shard, "pop", stat, NULL, local_before,
                              local_before, 0, cur_ms, false);
     struct mset_stat *queue_next =
@@ -1220,8 +1299,7 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
                                         ? mset_debug_count_local_heads(
                                               next_ready, shard->id)
                                         : 0;
-        atomic_store_explicit(&next_ready->dbg_bfs_cascade, 1,
-                              memory_order_relaxed);
+        MSET_DBG_STORE(next_ready->dbg_bfs_cascade, 1);
         mset_debug_cascade_event(shard, "enqueue", next_ready, stat,
                                  next_local_heads, next_local_heads, 0,
                                  cur_ms, suspicious);
@@ -1248,8 +1326,7 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
           queue_cap = new_cap;
         }
         queue[queue_tail++] = next_ready;
-        atomic_store_explicit(&next_ready->dbg_bfs_enqueue_ms, cur_ms,
-                              memory_order_relaxed);
+        MSET_DBG_STORE(next_ready->dbg_bfs_enqueue_ms, cur_ms);
         queue_next = queue_head < queue_tail ? queue[queue_head] : NULL;
         queue_last = queue_tail > queue_head ? queue[queue_tail - 1] : NULL;
         mset_debug_bfs_event(shard, "enqueue_after", next_ready, queue_next,
@@ -1260,9 +1337,8 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
 
     struct mset_stat *next_in_queue =
         queue_head < queue_tail ? queue[queue_head] : NULL;
-    atomic_store_explicit(&stat->dbg_bfs_done_ms, cur_ms, memory_order_relaxed);
-    atomic_store_explicit(&stat->dbg_bfs_processed, n_processed,
-                          memory_order_relaxed);
+    MSET_DBG_STORE(stat->dbg_bfs_done_ms, cur_ms);
+    MSET_DBG_STORE(stat->dbg_bfs_processed, n_processed);
     uint32_t local_after =
         mset_debug_enabled() ? mset_debug_count_local_heads(stat, shard->id) : 0;
     mset_debug_cascade_event(shard, "done", stat, next_in_queue, local_before,
@@ -1316,8 +1392,10 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
             }
           }
           mset_set_ok_reply(shard, stat, "fin_local");
+#if FREAKV_PROFILE
           uint64_t e2e = stat->start_cycles;
           PROF_RECORD_HIST(shard->prof.mset_total_e2e, shard->prof.mset_e2e_hist, e2e);
+#endif
           stat_free_real(engine, shard, stat);
         } else {
           if (mset_debug_enabled()) {
@@ -1346,8 +1424,7 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
               .pipeline_idx = stat->pipeline_idx,
               .kv_obj_ptr = stat,
           };
-          atomic_store_explicit(&stat->dbg_send_fin_ack_ms, now_ms(),
-                                memory_order_relaxed);
+          MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
           mset_debug_lifecycle(shard, stat, "send_fin_ack", now_ms(),
                                stat->coordinator_id);
           send_to_shard(engine, shard->id, stat->coordinator_id, &fack);
@@ -1454,8 +1531,10 @@ static bool mset_try_early_commit(struct shard_engine *engine,
       }
     }
     mset_set_ok_reply(shard, stat, "early_fin_local");
+#if FREAKV_PROFILE
     uint64_t e2e = stat->start_cycles;
     PROF_RECORD_HIST(shard->prof.mset_total_e2e, shard->prof.mset_e2e_hist, e2e);
+#endif
     stat_free_real(engine, shard, stat);
   } else {
     if (mset_debug_enabled()) {
@@ -1483,8 +1562,7 @@ static bool mset_try_early_commit(struct shard_engine *engine,
         .pipeline_idx    = stat->pipeline_idx,
         .kv_obj_ptr      = stat,
     };
-    atomic_store_explicit(&stat->dbg_send_fin_ack_ms, now_ms(),
-                          memory_order_relaxed);
+    MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "early_send_fin_ack", now_ms(),
                          stat->coordinator_id);
     send_to_shard(engine, shard->id, stat->coordinator_id, &fack);
@@ -1504,7 +1582,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
                                           struct shard *shard,
                                           struct spsc_message *msg,
                                           uint64_t cur_ms) {
-  uint64_t start_cycles = cycles_now();
+  uint64_t start_cycles = PROF_NOW();
   struct lock_manager *lm = &shard->lm;
   struct slab_allocator *pool = shard->pool;
 
@@ -1523,14 +1601,14 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), VAL_TYPE_STRING);
   uint64_t hash56 = meta >> 8;
 
-  uint64_t t_get = cycles_now();
+  uint64_t t_get = PROF_NOW();
   struct kv_obj *obj_ptr =
       ht_bucket_get(shard->table, key, klen, VAL_TYPE_STRING, 0);
   PROF_RECORD(shard->prof.ht_get_internal, t_get);
   PROF_RECORD(shard->prof.ht_lookup, t_get);
 
   /* Allocate tentative new object */
-  uint64_t t_alloc = cycles_now();
+  uint64_t t_alloc = PROF_NOW();
   struct kv_obj *new_obj = alloc_new_obj(key, klen, val, vlen);
   PROF_RECORD(shard->prof.obj_alloc, t_alloc);
   if (!new_obj) {
@@ -1550,7 +1628,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
 
   if (key_is_new) {
     /* Tentative HT insert: makes key visible under the lock */
-    uint64_t t_ins = cycles_now();
+    uint64_t t_ins = PROF_NOW();
     struct kv_obj *replaced =
         shard_bucket_put(shard, new_obj, VAL_TYPE_STRING, 0, HT_PUT_NONE);
     PROF_RECORD(shard->prof.ht_insert, t_ins);
@@ -1582,7 +1660,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   }
 
   /* Look up existing lock entry */
-  uint64_t t_lm = cycles_now();
+  uint64_t t_lm = PROF_NOW();
   struct lock_entry *le = lock_manager_lookup(lm, lock_key, hash56);
   PROF_RECORD(shard->prof.lm_lookup, t_lm);
 
@@ -1611,7 +1689,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
 
     /* ── Duplicate in wait queue (same txn waiting) ── */
     struct wait_group *dup_wg = NULL;
-    uint64_t t_wq = cycles_now();
+    uint64_t t_wq = PROF_NOW();
     struct cmd_info *dup_cmd = lock_wq_find_txn(le, &txn, &dup_wg);
     PROF_RECORD(shard->prof.lm_wq_find, t_wq);
     if (dup_cmd) {
@@ -1647,7 +1725,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   }
 
   /* ── Allocate cmd_info ── */
-  uint64_t t_slab = cycles_now();
+  uint64_t t_slab = PROF_NOW();
   struct cmd_info *cmd = cmd_info_alloc(pool);
   PROF_RECORD(shard->prof.slab_alloc, t_slab);
   if (!cmd) {
@@ -1685,7 +1763,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
 
   if (!le) {
     /* ═══ CASE A: No lock — acquire ═══ */
-    uint64_t t_ins2 = cycles_now();
+    uint64_t t_ins2 = PROF_NOW();
     le = lock_manager_insert(lm, lock_key, hash56, cmd);
     PROF_RECORD(shard->prof.lm_insert, t_ins2);
     if (!le) {
@@ -1745,7 +1823,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
           cmd->old_obj = NULL;
         }
 
-        uint64_t t_ins2 = cycles_now();
+        uint64_t t_ins2 = PROF_NOW();
         le = lock_manager_insert(lm, lock_key, hash56, cmd);
         PROF_RECORD(shard->prof.lm_insert, t_ins2);
         if (!le) {
@@ -1822,7 +1900,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   }
 
   if (can_preempt) {
-    PROF_RECORD(shard->prof.lm_preempt_success, cycles_now());
+    PROF_RECORD(shard->prof.lm_preempt_success, PROF_NOW());
 
     cmd->old_obj = incumbent->old_obj;
     /* 
@@ -1840,7 +1918,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
        */
     }
 
-    uint64_t t_wq = cycles_now();
+    uint64_t t_wq = PROF_NOW();
     lock_wq_add_mset(lm, le, incumbent);
     PROF_RECORD(shard->prof.lm_wq_add, t_wq);
     le->holder = cmd;
@@ -1868,7 +1946,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   if (key_is_new)
     ht_bucket_delete(shard->table, key, klen, VAL_TYPE_STRING);
   cmd->le = le;
-  uint64_t t_wq2 = cycles_now();
+  uint64_t t_wq2 = PROF_NOW();
   lock_wq_add_mset(lm, le, cmd);
   PROF_RECORD(shard->prof.lm_wq_add, t_wq2);
   shard->ops_completed++;
@@ -2070,7 +2148,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
                                           char **argv,
                                           size_t *arglen,
                                           struct net_buf *req_nb) {
-  uint64_t start_cycles = cycles_now();
+  uint64_t start_cycles = PROF_NOW();
   uint32_t npairs = (uint32_t)(argc - 1) / 2;
   uint32_t my_id = r->shard->id;
   uint32_t nshards = r->engine->num_shards;
@@ -2085,7 +2163,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
   if (nb)
     net_buf_ref(nb);
 
-  uint64_t t0 = cycles_now();
+  uint64_t t0 = PROF_NOW();
   struct mset_stat *stat =
       (struct mset_stat *)slab_obj_alloc(pool, sizeof(struct mset_stat));
   PROF_RECORD(r->shard->prof.coord_stat_alloc, t0);
@@ -2108,22 +2186,26 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
   stat->pipeline_idx = pipeline_seq;
   stat->coordinator_id = (uint8_t)my_id;
   stat->batch_cleanup_head = NULL;
-  stat->start_cycles = cycles_now();
+#if FREAKV_PROFILE
+  stat->start_cycles = PROF_NOW();
+#endif
+#if FREAKV_MSET_DEBUG
   stat->start_ms = now_ms();
   stat->last_debug_ms = 0;
-  atomic_init(&stat->dbg_ack_last_ms, 0);
-  atomic_init(&stat->dbg_on_ack_ms, 0);
-  atomic_init(&stat->dbg_broadcast_fin_ms, 0);
-  atomic_init(&stat->dbg_run_fin_ms, 0);
-  atomic_init(&stat->dbg_send_fin_remote_ms, 0);
-  atomic_init(&stat->dbg_on_fin_ms, 0);
-  atomic_init(&stat->dbg_send_fin_ack_ms, 0);
-  atomic_init(&stat->dbg_on_fin_ack_ms, 0);
-  atomic_init(&stat->dbg_bfs_enqueue_ms, 0);
-  atomic_init(&stat->dbg_bfs_pop_ms, 0);
-  atomic_init(&stat->dbg_bfs_done_ms, 0);
-  atomic_init(&stat->dbg_bfs_processed, 0);
-  atomic_init(&stat->dbg_bfs_cascade, 0);
+  MSET_DBG_INIT(stat->dbg_ack_last_ms, 0);
+  MSET_DBG_INIT(stat->dbg_on_ack_ms, 0);
+  MSET_DBG_INIT(stat->dbg_broadcast_fin_ms, 0);
+  MSET_DBG_INIT(stat->dbg_run_fin_ms, 0);
+  MSET_DBG_INIT(stat->dbg_send_fin_remote_ms, 0);
+  MSET_DBG_INIT(stat->dbg_on_fin_ms, 0);
+  MSET_DBG_INIT(stat->dbg_send_fin_ack_ms, 0);
+  MSET_DBG_INIT(stat->dbg_on_fin_ack_ms, 0);
+  MSET_DBG_INIT(stat->dbg_bfs_enqueue_ms, 0);
+  MSET_DBG_INIT(stat->dbg_bfs_pop_ms, 0);
+  MSET_DBG_INIT(stat->dbg_bfs_done_ms, 0);
+  MSET_DBG_INIT(stat->dbg_bfs_processed, 0);
+  MSET_DBG_INIT(stat->dbg_bfs_cascade, 0);
+#endif
   memset(stat->shard_heads, 0, sizeof(stat->shard_heads));
 
   /* Hold a ref on the input buffer until all PREPARE memcpy's are done.
@@ -2137,10 +2219,12 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
       &c->proxy.slots[pipeline_seq & (c->proxy.cap - 1)];
   ps->kv_obj_ptr = stat;
   ps->parent_cmd_id = MSG_CMD_MSET_PART;
+#if FREAKV_MSET_DEBUG
   if (mset_debug_enabled()) {
     ps->debug_mset_stat = stat;
     ps->debug_mset_start_ms = stat->start_ms;
   }
+#endif
 
   uint32_t wake_mask = 0;
 
@@ -2152,7 +2236,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
 
   /* ── Pass 1: count remote keys per shard ── */
   for (uint32_t i = 0; i < npairs; i++) {
-    uint64_t t1 = cycles_now();
+    uint64_t t1 = PROF_NOW();
     uint32_t target =
         shard_for_key(argv[1 + i * 2], arglen[1 + i * 2], nshards);
     PROF_RECORD(r->shard->prof.coord_hash, t1);
@@ -2204,7 +2288,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
           .reply_int       = (int64_t)txn_ts,
           .kv_obj_ptr      = stat,
       };
-      uint64_t t_local = cycles_now();
+      uint64_t t_local = PROF_NOW();
       mset_on_prepare(engine, r->shard, &msg, now_ms());
       PROF_RECORD(r->shard->prof.coord_local_exec, t_local);
     } else {
@@ -2231,7 +2315,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
         .kv_obj_ptr      = stat,
     };
     struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
-    uint64_t t2 = cycles_now();
+    uint64_t t2 = PROF_NOW();
     while (!spsc_queue_push(q, &bmsg))
       __builtin_ia32_pause();
     PROF_RECORD(r->shard->prof.coord_queue_wait, t2);
@@ -2239,7 +2323,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
   }
 
   if (wake_mask && engine->wake_fds) {
-    uint64_t t3 = cycles_now();
+    uint64_t t3 = PROF_NOW();
     for (uint32_t sid = 0; sid < nshards; sid++) {
       if ((wake_mask & (1U << sid)) && engine->wake_fds[sid] >= 0) {
         uint64_t one = 1;
@@ -2272,10 +2356,12 @@ void mset_on_prepare(struct shard_engine *engine, struct shard *shard,
 
 void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
                             struct spsc_message *msg, uint64_t cur_ms) {
+#if FREAKV_PROFILE
   PROF_RECORD(shard->prof.mset_prepare_queue_latency, msg->sent_cycles);
+#endif
   struct mset_batch *batch = (struct mset_batch *)msg->key_ptr;
   bool mix_prof = mixed_profile_enabled();
-  uint64_t batch_start = mix_prof ? cycles_now() : 0;
+  uint64_t batch_start = mix_prof ? PROF_NOW() : 0;
   uint64_t max_entry_cycles = 0;
   uint32_t slow_idx = 0;
   uint32_t ready_count = 0;
@@ -2297,14 +2383,14 @@ void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
         .reply_int       = msg->reply_int,  /* txn_ts */
         .kv_obj_ptr      = msg->kv_obj_ptr, /* stat   */
     };
-    uint64_t entry_start = mix_prof ? cycles_now() : 0;
+    uint64_t entry_start = mix_prof ? PROF_NOW() : 0;
     struct mset_stat *ready = mset_prepare_key(engine, shard, &key_msg, cur_ms);
     if (ready) {
       ready_count++;
       mset_broadcast_fin(engine, shard, ready);
     }
     if (mix_prof) {
-      uint64_t entry_cycles = cycles_now() - entry_start;
+      uint64_t entry_cycles = PROF_NOW() - entry_start;
       if (entry_cycles > max_entry_cycles) {
         max_entry_cycles = entry_cycles;
         slow_idx = i;
@@ -2312,7 +2398,7 @@ void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
     }
   }
   if (mix_prof) {
-    uint64_t total_cycles = cycles_now() - batch_start;
+    uint64_t total_cycles = PROF_NOW() - batch_start;
     uint64_t slow = mixed_profile_slow_cycles();
     uint64_t early_after =
         shard->id < MAX_SHARDS ? mixed_early_commit_count[shard->id] : early_before;
@@ -2336,7 +2422,7 @@ void mset_on_fin(struct shard_engine *engine, struct shard *shard,
   struct mset_stat *stat = (struct mset_stat *)msg->kv_obj_ptr;
   if (!stat)
     return;
-  atomic_store_explicit(&stat->dbg_on_fin_ms, cur_ms, memory_order_relaxed);
+  MSET_DBG_STORE(stat->dbg_on_fin_ms, cur_ms);
   mset_debug_lifecycle(shard, stat, "on_fin", cur_ms, msg->shard_owner);
   mset_run_fin(engine, shard, stat, cur_ms);
 }
@@ -2351,8 +2437,10 @@ void mset_on_fin(struct shard_engine *engine, struct shard *shard,
  */
 void mset_on_ack(struct shard_engine *engine, struct shard *shard,
                  struct spsc_message *ack_msg) {
+#if FREAKV_PROFILE
   PROF_RECORD(shard->prof.mset_ack_queue_latency, ack_msg->sent_cycles);
-  uint64_t start_cycles = cycles_now();
+#endif
+  uint64_t start_cycles = PROF_NOW();
   struct net_conn *c = (struct net_conn *)ack_msg->conn_ptr;
 
   if (!c || c->generation != ack_msg->conn_generation)
@@ -2374,7 +2462,7 @@ void mset_on_ack(struct shard_engine *engine, struct shard *shard,
   }
 
   ps->kv_obj_ptr = NULL;
-  atomic_store_explicit(&stat->dbg_on_ack_ms, now_ms(), memory_order_relaxed);
+  MSET_DBG_STORE(stat->dbg_on_ack_ms, now_ms());
   mset_debug_lifecycle(shard, stat, "on_ack", now_ms(), ack_msg->shard_owner);
   mset_broadcast_fin(engine, shard, stat);
 
@@ -2391,13 +2479,12 @@ void mset_on_ack(struct shard_engine *engine, struct shard *shard,
 void mset_on_fin_ack(struct shard_engine *engine, struct shard *shard,
                      struct spsc_message *msg) {
   (void)engine;
-  uint64_t start_cycles = cycles_now();
+  uint64_t start_cycles = PROF_NOW();
   struct mset_stat *stat = (struct mset_stat *)msg->kv_obj_ptr;
   if (!stat)
     return;
 
-  atomic_store_explicit(&stat->dbg_on_fin_ack_ms, now_ms(),
-                        memory_order_relaxed);
+  MSET_DBG_STORE(stat->dbg_on_fin_ack_ms, now_ms());
   mset_debug_lifecycle(shard, stat, "on_fin_ack", now_ms(), msg->shard_owner);
 
   if (mset_debug_enabled()) {
@@ -2418,8 +2505,10 @@ void mset_on_fin_ack(struct shard_engine *engine, struct shard *shard,
   }
 
   mset_set_ok_reply(shard, stat, "fin_ack");
+#if FREAKV_PROFILE
   uint64_t e2e = stat->start_cycles;
   PROF_RECORD_HIST(shard->prof.mset_total_e2e, shard->prof.mset_e2e_hist, e2e);
+#endif
   stat_free_real(engine, shard, stat);
 
   PROF_RECORD(shard->prof.mset_fin_ack, start_cycles);
@@ -2467,10 +2556,10 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
 
   /* Early commit: if MSET holder is fully prepared, commit it now so this
    * command doesn't need to queue at all. */
-  uint64_t t_early = prof ? cycles_now() : 0;
+  uint64_t t_early = prof ? PROF_NOW() : 0;
   bool early = mset_try_early_commit(shard->engine, shard, le, now_ms());
   if (early) {
-    uint64_t early_cycles = prof ? cycles_now() - t_early : 0;
+    uint64_t early_cycles = prof ? PROF_NOW() - t_early : 0;
     if (!ht_bucket_is_locked(shard->table, key, klen, VAL_TYPE_STRING)) {
       if (prof) {
         lock_early_unlock[shard->id]++;
@@ -2502,7 +2591,9 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
 
   cmd->is_mset = false;
   cmd->msg = *msg;
-  cmd->defer_cycles = cycles_now();
+#if FREAKV_MIXED_PROFILE
+  cmd->defer_cycles = PROF_NOW();
+#endif
   cmd->origin_shard = msg->shard_owner;
   cmd->req_nb = msg->req_nb;
   if (cmd->req_nb)
@@ -2512,7 +2603,10 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
   if (prof) {
     uint64_t cur_ms = now_ms();
     uint16_t cmd_op = MSG_GET_CMD(msg->op);
-    uint64_t inbox_q = msg->sent_cycles ? cmd->defer_cycles - msg->sent_cycles : 0;
+    uint64_t inbox_q = 0;
+#if FREAKV_MIXED_PROFILE
+    inbox_q = msg->sent_cycles ? cmd->defer_cycles - msg->sent_cycles : 0;
+#endif
     lock_deferred[shard->id]++;
     if (mixed_is_set_cmd(cmd_op)) {
       set_deferred[shard->id]++;

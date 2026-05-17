@@ -458,8 +458,10 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                              .conn_ptr = c,
                              .conn_generation = c->generation,
                              .pipeline_idx = pipeline_seq,
-                             .req_nb = c->rbuf_nb,
-                             .sent_cycles = cycles_now()};
+                             .req_nb = c->rbuf_nb};
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+  msg.sent_cycles = PROF_NOW();
+#endif
   if (msg.req_nb)
     net_buf_ref(msg.req_nb);
   /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
@@ -734,8 +736,10 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                                  .conn_ptr = c,
                                  .conn_generation = c->generation,
                                  .pipeline_idx = pipeline_seq,
-                                 .sub_idx = i,
-                                 .sent_cycles = cycles_now()};
+                                 .sub_idx = i};
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+      msg.sent_cycles = PROF_NOW();
+#endif
       /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
        * and rarely fills under normal load. If the target shard stalls
        * (eviction, snapshot I/O), this busy-wait will add latency to this
@@ -890,8 +894,10 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             .sub_idx = i,
             .req_nb = c->rbuf_nb,
             .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl,
-            .sent_cycles = cycles_now()};
+            .key_len = (uint32_t)pkl};
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+        msg.sent_cycles = PROF_NOW();
+#endif
         enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
         if (exec_rc == PROXY_EXEC_DONE) {
           s->multi_replies[i] = (uint8_t *)msg.reply_buf;
@@ -913,8 +919,10 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             .sub_idx = i,
             .req_nb = c->rbuf_nb,
             .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl,
-            .sent_cycles = cycles_now()};
+            .key_len = (uint32_t)pkl};
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+        msg.sent_cycles = PROF_NOW();
+#endif
         if (msg.req_nb)
           net_buf_ref(msg.req_nb);
         spsc_queue_push(q, &msg);

@@ -18,12 +18,16 @@
 #include <ctype.h>
 
 static bool mixed_profile_enabled(void) {
+#if !FREAKV_MIXED_PROFILE
+  return false;
+#else
   static int cached = -1;
   if (cached < 0) {
     const char *v = getenv("MSET_MIXED_PROFILE");
     cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
   }
   return cached != 0;
+#endif
 }
 
 static uint64_t mixed_profile_slow_cycles(void) {
@@ -121,7 +125,7 @@ static void shard_obj_free(struct shard *s, struct kv_obj *o) {
       mem_free(ptr);
   }
 
-  uint64_t t0 = cycles_now();
+  uint64_t t0 = PROF_NOW();
   mem_free(o);
   if (s->snap.interval_ms == 0) {
     PROF_RECORD(s->prof.free_std, t0);
@@ -154,7 +158,7 @@ void shard_obj_destroy(struct shard *s, struct kv_obj *o) {
       total <= SMALL_ALLOC_MAX ? POOL_CLASSES[pool_idx_get(total)] : 0;
 
   if (g_snapshot_active) {
-    uint64_t t_m = cycles_now();
+    uint64_t t_m = PROF_NOW();
     snap_obj_mark(&s->snap, s->mem, o, obj_size);
     PROF_RECORD(s->prof.mark_snap, t_m);
 
@@ -232,17 +236,17 @@ struct kv_obj *shard_bucket_put(struct shard *s, struct kv_obj *obj,
 bool shard_key_set(struct shard *s, const void *key, size_t klen,
                    const char *val, size_t vlen, uint64_t expire_ms,
                    uint32_t put_flags) {
-  uint64_t t_set = cycles_now();
+  uint64_t t_set = PROF_NOW();
   /* Pre-check NX/XX condition before allocating — avoids alloc+rollback. */
   if (put_flags & HT_PUT_NX) {
-    uint64_t t_h = cycles_now();
+    uint64_t t_h = PROF_NOW();
     if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) != NULL) {
       PROF_RECORD(s->prof.ht_lookup, t_h);
       return false;
     }
     PROF_RECORD(s->prof.ht_lookup, t_h);
   } else if (put_flags & HT_PUT_XX) {
-    uint64_t t_h = cycles_now();
+    uint64_t t_h = PROF_NOW();
     if (ht_bucket_get(s->table, key, klen, VAL_TYPE_STRING, 0) == NULL) {
       PROF_RECORD(s->prof.ht_lookup, t_h);
       return false;
@@ -251,7 +255,7 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
   }
 
   size_t total = sizeof(struct kv_obj) + klen + vlen + 1;
-  uint64_t t0 = cycles_now();
+  uint64_t t0 = PROF_NOW();
   struct kv_obj *o = mem_malloc(total);
   PROF_RECORD(s->prof.obj_alloc, t0);
   if (!o)
@@ -276,11 +280,11 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
       total <= SMALL_ALLOC_MAX ? POOL_CLASSES[pool_idx_get(total)] : 0;
 
   if (g_snapshot_active) {
-    uint64_t t_m = cycles_now();
+    uint64_t t_m = PROF_NOW();
     snap_obj_mark(&s->snap, s->mem, o, obj_size);
     PROF_RECORD(s->prof.mark_snap, t_m);
   }
-  uint64_t t_p = cycles_now();
+  uint64_t t_p = PROF_NOW();
   struct kv_obj *old =
       shard_bucket_put(s, o, VAL_TYPE_STRING, expire_ms, HT_PUT_NONE);
   PROF_RECORD(s->prof.ht_insert, t_p);
@@ -308,9 +312,9 @@ bool shard_key_set(struct shard *s, const void *key, size_t klen,
 
 struct kv_obj *shard_key_get(struct shard *s, const void *key, size_t klen,
                              uint64_t net_time_ms_get) {
-  uint64_t t_get = cycles_now();
+  uint64_t t_get = PROF_NOW();
   struct kv_obj *expired = NULL;
-  uint64_t t_h = cycles_now();
+  uint64_t t_h = PROF_NOW();
   struct kv_obj *v = ht_bucket_get_lazy(s->table, key, klen, VAL_TYPE_STRING,
                                         net_time_ms_get, &expired);
   PROF_RECORD(s->prof.ht_lookup, t_h);
@@ -727,7 +731,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
                      shard_proxy_reply_fn proxy_cb, void *proxy_ctx) {
   uint64_t cur = 0;
   bool drain_prof = mixed_profile_enabled();
-  uint64_t drain_start = drain_prof ? cycles_now() : 0;
+  uint64_t drain_start = drain_prof ? PROF_NOW() : 0;
   uint32_t total_msgs = 0;
   uint32_t reply_msgs = 0;
   uint32_t release_msgs = 0;
@@ -783,8 +787,12 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
         uint64_t q_cycles = 0;
         uint64_t t_msg = 0;
         if (mix_prof) {
-          uint64_t now_c = cycles_now();
+          uint64_t now_c = PROF_NOW();
+#if FREAKV_MIXED_PROFILE
           q_cycles = msg.sent_cycles ? now_c - msg.sent_cycles : 0;
+#else
+          q_cycles = 0;
+#endif
           t_msg = now_c;
         }
 
@@ -794,7 +802,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
             mset_key_msgs++;
           mset_on_prepare(engine, shard, &msg, cur);
           if (mix_prof) {
-            uint64_t dur = cycles_now() - t_msg;
+            uint64_t dur = PROF_NOW() - t_msg;
             uint64_t slow = mixed_profile_slow_cycles();
             if (dur >= slow || q_cycles >= slow)
               fprintf(stderr,
@@ -814,7 +822,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
               msg.key_ptr ? ((struct mset_batch *)msg.key_ptr)->count : 0;
           mset_on_prepare_batch(engine, shard, &msg, cur);
           if (mix_prof) {
-            uint64_t dur = cycles_now() - t_msg;
+            uint64_t dur = PROF_NOW() - t_msg;
             uint64_t slow = mixed_profile_slow_cycles();
             if (dur >= slow || q_cycles >= slow)
               fprintf(stderr,
@@ -832,7 +840,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
             mset_fin_msgs++;
           mset_on_fin(engine, shard, &msg, cur);
           if (mix_prof) {
-            uint64_t dur = cycles_now() - t_msg;
+            uint64_t dur = PROF_NOW() - t_msg;
             uint64_t slow = mixed_profile_slow_cycles();
             if (dur >= slow || q_cycles >= slow)
               fprintf(stderr,
@@ -855,7 +863,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
         }
         enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
         if (mix_prof) {
-          uint64_t dur = cycles_now() - t_msg;
+          uint64_t dur = PROF_NOW() - t_msg;
           uint64_t slow = mixed_profile_slow_cycles();
           if (dur >= slow || q_cycles >= slow || exec_rc == PROXY_EXEC_DEFERRED)
             fprintf(stderr,
@@ -917,7 +925,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
     }
   }
   if (drain_prof && total_msgs > 0) {
-    uint64_t total_cycles = cycles_now() - drain_start;
+    uint64_t total_cycles = PROF_NOW() - drain_start;
     uint64_t slow = mixed_profile_slow_cycles();
     if (total_cycles >= slow || total_msgs >= 256 || max_sender_run >= 128) {
       fprintf(stderr,
@@ -1172,6 +1180,7 @@ void shard_engine_stats_print(const struct shard_engine *e) {
   printf("%-6s %-14lu %-14lu %-10u %-10u\n\n", "TOTAL", pending_enq,
          pending_res, pending_cur, pending_max);
 
+#if FREAKV_PROFILE
   /* ── Async MSET 2PC Profiling ─────────────────────────────────── */
   printf("  Async MSET 2PC Profiling (Avg CPU Cycles per Call)\n");
   printf("---------------------------------------------------------------------"
@@ -1402,6 +1411,7 @@ void shard_engine_stats_print(const struct shard_engine *e) {
   }
   printf("---------------------------------------------------------------------"
          "-----------------------------------------------------------\n\n");
+#endif
 }
 
 bool shard_mem_evict(struct shard *s, size_t size_req) {

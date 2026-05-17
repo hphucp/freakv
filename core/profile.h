@@ -5,8 +5,26 @@
 #include <stdio.h>
 #include <x86intrin.h>
 
+#ifndef FREAKV_PROFILE
+#define FREAKV_PROFILE 0
+#endif
+
+#ifndef FREAKV_MSET_DEBUG
+#define FREAKV_MSET_DEBUG 0
+#endif
+
+#ifndef FREAKV_MIXED_PROFILE
+#define FREAKV_MIXED_PROFILE 0
+#endif
+
 /* Simple cycle measurement using RDTSC */
 static inline uint64_t cycles_now() { return __rdtsc(); }
+
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+#define PROF_NOW() cycles_now()
+#else
+#define PROF_NOW() 0ULL
+#endif
 
 struct prof_metric {
   uint64_t total_cycles;
@@ -14,6 +32,7 @@ struct prof_metric {
   uint64_t max_cycles;
 };
 
+#if FREAKV_PROFILE
 #define PROF_RECORD(metric, start)                                             \
   do {                                                                         \
     uint64_t delta = cycles_now() - (start);                                   \
@@ -22,6 +41,11 @@ struct prof_metric {
     if (delta > (metric).max_cycles)                                           \
       (metric).max_cycles = delta;                                             \
   } while (0)
+#else
+#define PROF_RECORD(metric, start)                                             \
+  do {                                                                         \
+  } while (0)
+#endif
 
 /* ── Latency histogram (power-of-2 buckets) ─────────────────────────── */
 
@@ -35,6 +59,7 @@ struct prof_hist {
  * Record to both a prof_metric and a prof_hist in one RDTSC read.
  * bucket k covers [2^k, 2^(k+1)) cycles.
  */
+#if FREAKV_PROFILE
 #define PROF_RECORD_HIST(metric, hist, start)                                  \
   do {                                                                         \
     uint64_t _delta = cycles_now() - (uint64_t)(start);                       \
@@ -45,6 +70,11 @@ struct prof_hist {
     if (_b >= PROF_HIST_BUCKETS) _b = PROF_HIST_BUCKETS - 1;                  \
     (hist).buckets[_b]++;                                                      \
   } while (0)
+#else
+#define PROF_RECORD_HIST(metric, hist, start)                                  \
+  do {                                                                         \
+  } while (0)
+#endif
 
 /*
  * Return the approximate cycle count at percentile p (0.0–1.0).
