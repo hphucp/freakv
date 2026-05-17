@@ -12,6 +12,9 @@ struct resp_cmd {
   size_t *arglen; /* dynamically allocated */
 };
 
+struct net_buf;
+struct mset_stat;
+
 /*
  * spsc_message op (16-bit):
  * [High 4 bits]: System Op (MSG_SYS_*)
@@ -118,29 +121,60 @@ struct spsc_message {
   uint16_t op;         /* Packed system op + command id            */
   uint8_t shard_owner; /* Shard that originated the message        */
   uint8_t _pad0;
-  struct resp_cmd cmd; /* Parsed command (passed by value)         */
-  /* Routing/Extraction fields for split commands */
-  void *key_ptr;
-  uint32_t key_len;
-  uint32_t val_len;
-  void *val_ptr;
+  union {
+    struct {
+      struct resp_cmd cmd; /* Parsed command (passed by value)       */
+      void *conn_ptr;
+      struct net_buf *req_nb; /* input buffer refcount                 */
+      uint32_t pipeline_idx;  /* Sequence number in proxy pipeline     */
+    } regular_req;
 
-  /* Batch/Context information */
-  uint32_t pipeline_idx; /* Sequence number in proxy pipeline        */
-  uint32_t sub_idx;      /* Index within multi-key command           */
-  void *conn_ptr;
-  uint64_t conn_generation;
-  struct net_buf *req_nb; /* input buffer refcount */
+    struct {
+      void *key_ptr;
+      void *conn_ptr;
+      struct net_buf *req_nb;
+      uint32_t key_len;
+      uint32_t pipeline_idx;
+      uint32_t sub_idx;
+    } key_part_req;
 
-  /* Reply information */
-  void *kv_obj_ptr;  /* Ref'd object for zero-copy reply         */
-  void *old_obj_ptr; /* Previous object for atomic MSET rollback */
-  void *reply_buf;   /* RESP binary reply                        */
-  uint32_t reply_len;
-  uint8_t reply_type; /* enum msg_reply_type */
-  uint8_t _pad1;
-  uint16_t _pad2;
-  int64_t reply_int; /* For INT replies */
+    struct {
+      void *conn_ptr;
+      uint32_t pipeline_idx;
+      uint32_t sub_idx;
+    } dbsize_req;
+
+    struct {
+      void *conn_ptr;
+      struct net_buf *req_nb;
+      void *kv_obj_ptr; /* Ref'd object for zero-copy reply         */
+      void *reply_buf;  /* RESP binary reply                        */
+      int64_t reply_int; /* For INT replies                         */
+      uint32_t pipeline_idx;
+      uint32_t sub_idx;
+      uint32_t reply_len;
+      uint8_t reply_type; /* enum msg_reply_type                     */
+    } reply;
+
+    struct {
+      void *kv_obj_ptr;
+      void *reply_buf;
+    } release;
+
+    struct {
+      struct mset_batch *batch;
+      struct mset_stat *stat;
+    } mset_prepare_batch;
+
+    struct {
+      void *conn_ptr;
+      uint32_t pipeline_idx;
+    } mset_ack;
+
+    struct {
+      struct mset_stat *stat;
+    } mset_stat;
+  } u;
 #if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
   uint64_t sent_cycles; /* Timestamp when message was pushed to queue */
 #endif

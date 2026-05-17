@@ -454,16 +454,17 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
       &engine->queues[my_id * engine->num_shards + target_shard];
   struct spsc_message msg = {.op = MSG_PACK_OP(MSG_SYS_REQ, cmd_op),
                              .shard_owner = (uint8_t)my_id,
-                             .cmd = *cmd,
-                             .conn_ptr = c,
-                             .conn_generation = c->generation,
-                             .pipeline_idx = pipeline_seq,
-                             .req_nb = c->rbuf_nb};
+                             .u.regular_req = {
+                                 .cmd = *cmd,
+                                 .conn_ptr = c,
+                                 .req_nb = c->rbuf_nb,
+                                 .pipeline_idx = pipeline_seq,
+                             }};
 #if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
   msg.sent_cycles = PROF_NOW();
 #endif
-  if (msg.req_nb)
-    net_buf_ref(msg.req_nb);
+  if (msg.u.regular_req.req_nb)
+    net_buf_ref(msg.u.regular_req.req_nb);
   /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
    * and rarely fills under normal load. If the target shard stalls (eviction,
    * snapshot I/O), this busy-wait will add latency to this shard's reactor.
@@ -531,11 +532,12 @@ static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
   struct spsc_message msg = {
       .op = MSG_PACK_OP(MSG_SYS_REQ, cmd_op),
       .shard_owner = (uint8_t)r->shard->id,
-      .cmd = s->cmd,
-      .conn_ptr = c,
-      .conn_generation = c->generation,
-      .pipeline_idx = pipeline_seq,
-      .req_nb = c->rbuf_nb,
+      .u.regular_req = {
+          .cmd = s->cmd,
+          .conn_ptr = c,
+          .req_nb = c->rbuf_nb,
+          .pipeline_idx = pipeline_seq,
+      },
   };
   bool prof = resp_mixed_profile_enabled();
   uint64_t t_exec = prof ? cycles_now() : 0;
@@ -554,11 +556,11 @@ static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
   if (exec_rc == PROXY_EXEC_DEFERRED)
     return 1;
 
-  s->reply_type = msg.reply_type;
-  s->reply_int = msg.reply_int;
-  s->reply_data = (uint8_t *)msg.reply_buf;
-  s->reply_len = msg.reply_len;
-  s->kv_obj_ptr = msg.kv_obj_ptr;
+  s->reply_type = msg.u.reply.reply_type;
+  s->reply_int = msg.u.reply.reply_int;
+  s->reply_data = (uint8_t *)msg.u.reply.reply_buf;
+  s->reply_len = msg.u.reply.reply_len;
+  s->kv_obj_ptr = msg.u.reply.kv_obj_ptr;
   s->state = PSLOT_DONE;
   return 2;
 }
@@ -733,10 +735,11 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           &r->engine->queues[r->shard->id * r->engine->num_shards + i];
       struct spsc_message msg = {.op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DBSIZE),
                                  .shard_owner = (uint8_t)r->shard->id,
-                                 .conn_ptr = c,
-                                 .conn_generation = c->generation,
-                                 .pipeline_idx = pipeline_seq,
-                                 .sub_idx = i};
+                                 .u.dbsize_req = {
+                                     .conn_ptr = c,
+                                     .pipeline_idx = pipeline_seq,
+                                     .sub_idx = i,
+                                 }};
 #if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
       msg.sent_cycles = PROF_NOW();
 #endif
@@ -888,22 +891,23 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MGET_PART),
             .shard_owner = (uint8_t)my_id,
-            .conn_ptr = c,
-            .conn_generation = c->generation,
-            .pipeline_idx = pipeline_seq,
-            .sub_idx = i,
-            .req_nb = c->rbuf_nb,
-            .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl};
+            .u.key_part_req = {
+                .key_ptr = (void *)pk,
+                .conn_ptr = c,
+                .req_nb = c->rbuf_nb,
+                .key_len = (uint32_t)pkl,
+                .pipeline_idx = pipeline_seq,
+                .sub_idx = i,
+            }};
 #if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
         msg.sent_cycles = PROF_NOW();
 #endif
         enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
         if (exec_rc == PROXY_EXEC_DONE) {
-          s->multi_replies[i] = (uint8_t *)msg.reply_buf;
-          s->multi_reply_lens[i] = msg.reply_len;
+          s->multi_replies[i] = (uint8_t *)msg.u.reply.reply_buf;
+          s->multi_reply_lens[i] = msg.u.reply.reply_len;
           if (s->multi_kv_objs)
-            s->multi_kv_objs[i] = msg.kv_obj_ptr;
+            s->multi_kv_objs[i] = msg.u.reply.kv_obj_ptr;
           if (s->multi_owners)
             s->multi_owners[i] = (uint8_t)my_id;
           s->multi_replied++;
@@ -913,18 +917,19 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MGET_PART),
             .shard_owner = (uint8_t)my_id,
-            .conn_ptr = c,
-            .conn_generation = c->generation,
-            .pipeline_idx = pipeline_seq,
-            .sub_idx = i,
-            .req_nb = c->rbuf_nb,
-            .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl};
+            .u.key_part_req = {
+                .key_ptr = (void *)pk,
+                .conn_ptr = c,
+                .req_nb = c->rbuf_nb,
+                .key_len = (uint32_t)pkl,
+                .pipeline_idx = pipeline_seq,
+                .sub_idx = i,
+            }};
 #if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
         msg.sent_cycles = PROF_NOW();
 #endif
-        if (msg.req_nb)
-          net_buf_ref(msg.req_nb);
+        if (msg.u.key_part_req.req_nb)
+          net_buf_ref(msg.u.key_part_req.req_nb);
         spsc_queue_push(q, &msg);
         remote_wake_mask |= (1U << kowner);
         remote_count++;
@@ -963,31 +968,31 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           uint16_t cmd_id = MSG_GET_CMD(msg.op);
 
           if (sys_op == MSG_SYS_RELEASE) {
-            if (msg.kv_obj_ptr)
-              shard_obj_unref(r->shard, (struct kv_obj *)msg.kv_obj_ptr);
-            if (msg.reply_buf)
-              slab_obj_free(r->shard->pool, msg.reply_buf);
+            if (msg.u.release.kv_obj_ptr)
+              shard_obj_unref(r->shard,
+                              (struct kv_obj *)msg.u.release.kv_obj_ptr);
+            if (msg.u.release.reply_buf)
+              slab_obj_free(r->shard->pool, msg.u.release.reply_buf);
             continue;
           }
 
           if (sys_op == MSG_SYS_REPLY) {
-            if (cmd_id == MSG_CMD_MGET_PART && msg.conn_ptr == c &&
-                msg.conn_generation == c->generation &&
-                msg.pipeline_idx == pipeline_seq) {
+            if (cmd_id == MSG_CMD_MGET_PART && msg.u.reply.conn_ptr == c &&
+                msg.u.reply.pipeline_idx == pipeline_seq) {
               /* This is one of our MGET replies */
-              uint32_t sidx = msg.sub_idx;
+              uint32_t sidx = msg.u.reply.sub_idx;
               if (sidx < nkeys) {
-                s->multi_replies[sidx] = (uint8_t *)msg.reply_buf;
-                s->multi_reply_lens[sidx] = msg.reply_len;
+                s->multi_replies[sidx] = (uint8_t *)msg.u.reply.reply_buf;
+                s->multi_reply_lens[sidx] = msg.u.reply.reply_len;
                 if (s->multi_kv_objs)
-                  s->multi_kv_objs[sidx] = msg.kv_obj_ptr;
+                  s->multi_kv_objs[sidx] = msg.u.reply.kv_obj_ptr;
                 if (s->multi_owners)
                   s->multi_owners[sidx] = msg.shard_owner;
                 s->multi_replied++;
               }
               remote_received++;
-              if (msg.req_nb)
-                net_buf_unref(r->shard->pool, msg.req_nb);
+              if (msg.u.reply.req_nb)
+                net_buf_unref(r->shard->pool, msg.u.reply.req_nb);
               continue;
             }
             /* Non-MGET reply — forward normally */
@@ -1001,8 +1006,14 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, cur);
             r->shard->cross_shard_received++;
             if (exec_rc == PROXY_EXEC_DEFERRED) {
-              if (msg.req_nb)
-                net_buf_unref(r->shard->pool, msg.req_nb);
+              uint16_t deferred_cmd = MSG_GET_CMD(msg.op);
+              struct net_buf *req_nb =
+                  (deferred_cmd == MSG_CMD_MGET_PART ||
+                   deferred_cmd == MSG_CMD_DEL_PART)
+                      ? msg.u.key_part_req.req_nb
+                      : msg.u.regular_req.req_nb;
+              if (req_nb)
+                net_buf_unref(r->shard->pool, req_nb);
               continue;
             }
             r->shard->ops_completed++;
@@ -1012,17 +1023,7 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             struct spsc_message reply = {
                 .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_GET_CMD(msg.op)),
                 .shard_owner = (uint8_t)my_id,
-                .conn_ptr = msg.conn_ptr,
-                .conn_generation = msg.conn_generation,
-                .pipeline_idx = msg.pipeline_idx,
-                .sub_idx = msg.sub_idx,
-                .kv_obj_ptr = msg.kv_obj_ptr,
-                .old_obj_ptr = msg.old_obj_ptr,
-                .reply_buf = msg.reply_buf,
-                .reply_len = msg.reply_len,
-                .reply_type = msg.reply_type,
-                .reply_int = msg.reply_int,
-                .req_nb = msg.req_nb};
+                .u.reply = msg.u.reply};
             spsc_queue_push(rq, &reply);
             if (engine->wake_fds && engine->wake_fds[msg.shard_owner] >= 0) {
               uint64_t one = 1;
@@ -1101,17 +1102,18 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DEL_PART),
             .shard_owner = (uint8_t)r->shard->id,
-            .conn_ptr = c,
-            .conn_generation = c->generation,
-            .pipeline_idx = pipeline_seq,
-            .sub_idx = i,
-            .req_nb = c->rbuf_nb,
-            .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl};
+            .u.key_part_req = {
+                .key_ptr = (void *)pk,
+                .conn_ptr = c,
+                .req_nb = c->rbuf_nb,
+                .key_len = (uint32_t)pkl,
+                .pipeline_idx = pipeline_seq,
+                .sub_idx = i,
+            }};
         enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
         if (exec_rc == PROXY_EXEC_DONE) {
-          s->multi_replies[i] = (uint8_t *)msg.reply_buf;
-          s->multi_reply_lens[i] = msg.reply_len;
+          s->multi_replies[i] = (uint8_t *)msg.u.reply.reply_buf;
+          s->multi_reply_lens[i] = msg.u.reply.reply_len;
           s->multi_owners[i] = (uint8_t)r->shard->id;
           s->multi_replied++;
         }
@@ -1121,15 +1123,16 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DEL_PART),
             .shard_owner = (uint8_t)r->shard->id,
-            .conn_ptr = c,
-            .conn_generation = c->generation,
-            .pipeline_idx = pipeline_seq,
-            .sub_idx = i,
-            .req_nb = c->rbuf_nb,
-            .key_ptr = (void *)pk,
-            .key_len = (uint32_t)pkl};
-        if (msg.req_nb)
-          net_buf_ref(msg.req_nb);
+            .u.key_part_req = {
+                .key_ptr = (void *)pk,
+                .conn_ptr = c,
+                .req_nb = c->rbuf_nb,
+                .key_len = (uint32_t)pkl,
+                .pipeline_idx = pipeline_seq,
+                .sub_idx = i,
+            }};
+        if (msg.u.key_part_req.req_nb)
+          net_buf_ref(msg.u.key_part_req.req_nb);
         /* Spin until space is available. The queue is large (SPSC_CAPACITY
          * slots) and rarely fills under normal load. If the target shard stalls
          * (eviction, snapshot I/O), this busy-wait will add latency to this

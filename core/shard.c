@@ -435,24 +435,44 @@ static inline uint64_t shard_now_ms(void) {
 enum proxy_exec_result proxy_exec(struct shard *s, struct spsc_message *msg,
                                   uint64_t cur) {
   uint16_t sub_op = MSG_GET_CMD(msg->op);
-  struct resp_cmd *cmd = &msg->cmd;
+  struct resp_cmd empty_cmd = {0};
+  struct resp_cmd *cmd = &empty_cmd;
+  void *conn_ptr = NULL;
+  struct net_buf *req_nb = NULL;
+  uint32_t pipeline_idx = 0;
+  uint32_t sub_idx = 0;
+
+  if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_DEL_PART) {
+    conn_ptr = msg->u.key_part_req.conn_ptr;
+    req_nb = msg->u.key_part_req.req_nb;
+    pipeline_idx = msg->u.key_part_req.pipeline_idx;
+    sub_idx = msg->u.key_part_req.sub_idx;
+  } else if (sub_op == MSG_CMD_DBSIZE) {
+    conn_ptr = msg->u.dbsize_req.conn_ptr;
+    pipeline_idx = msg->u.dbsize_req.pipeline_idx;
+    sub_idx = msg->u.dbsize_req.sub_idx;
+  } else {
+    cmd = &msg->u.regular_req.cmd;
+    conn_ptr = msg->u.regular_req.conn_ptr;
+    req_nb = msg->u.regular_req.req_nb;
+    pipeline_idx = msg->u.regular_req.pipeline_idx;
+  }
 
   /* Default */
-  msg->reply_type = REPLY_TYPE_ERR;
-  msg->reply_int = 0;
-  msg->reply_buf = NULL;
-  msg->reply_len = 0;
-  msg->kv_obj_ptr = NULL;
+  uint8_t reply_type = REPLY_TYPE_ERR;
+  int64_t reply_int = 0;
+  void *reply_buf = NULL;
+  uint32_t reply_len = 0;
+  void *kv_obj_ptr = NULL;
 
   const char *key = NULL;
   size_t klen = 0;
   if (cmd->argc > 1) {
     key = cmd->argv[1];
     klen = cmd->arglen[1];
-  } else if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_MSET_PART ||
-             sub_op == MSG_CMD_DEL_PART) {
-    key = (const char *)msg->key_ptr;
-    klen = msg->key_len;
+  } else if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_DEL_PART) {
+    key = (const char *)msg->u.key_part_req.key_ptr;
+    klen = msg->u.key_part_req.key_len;
   }
 
   if (key) {
@@ -460,15 +480,14 @@ enum proxy_exec_result proxy_exec(struct shard *s, struct spsc_message *msg,
       return PROXY_EXEC_DEFERRED;
   }
 
-  if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_MSET_PART ||
-      sub_op == MSG_CMD_DBSIZE || sub_op == MSG_CMD_DEL_PART ||
-      sub_op == MSG_CMD_MSET_PREPARE)
+  if (sub_op == MSG_CMD_MGET_PART || sub_op == MSG_CMD_DBSIZE ||
+      sub_op == MSG_CMD_DEL_PART || sub_op == MSG_CMD_MSET_PREPARE)
     goto dispatch;
 
   if (cmd->argc < 1) {
-    msg->reply_buf = "invalid proxy cmd";
-    msg->reply_len = 17;
-    return PROXY_EXEC_DONE;
+    reply_buf = "invalid proxy cmd";
+    reply_len = 17;
+    goto finish;
   }
 
 dispatch:
@@ -477,10 +496,10 @@ dispatch:
     struct kv_obj *v = shard_key_get(s, key, klen, cur);
     if (v) {
       shard_obj_ref(v);
-      msg->kv_obj_ptr = v;
-      msg->reply_type = REPLY_TYPE_KV_OBJ; /* Will use kv_obj_ptr directly */
+      kv_obj_ptr = v;
+      reply_type = REPLY_TYPE_KV_OBJ; /* Will use kv_obj_ptr directly */
     } else {
-      msg->reply_type = REPLY_TYPE_NIL;
+      reply_type = REPLY_TYPE_NIL;
     }
     break;
   }
@@ -526,13 +545,13 @@ dispatch:
     }
     bool ok = shard_key_set(s, key, klen, val, vlen, exp, put_flags);
     if (ok)
-      msg->reply_type = REPLY_TYPE_OK;
+      reply_type = REPLY_TYPE_OK;
     else if (nx || xx)
-      msg->reply_type = REPLY_TYPE_NIL;
+      reply_type = REPLY_TYPE_NIL;
     else {
-      msg->reply_type = REPLY_TYPE_ERR;
-      msg->reply_buf = "OOM";
-      msg->reply_len = 3;
+      reply_type = REPLY_TYPE_ERR;
+      reply_buf = "OOM";
+      reply_len = 3;
     }
     break;
   }
@@ -540,27 +559,27 @@ dispatch:
     long long count = 0;
     for (uint32_t i = 1; i < cmd->argc; i++)
       count += shard_key_delete(s, cmd->argv[i], cmd->arglen[i]) ? 1 : 0;
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = count;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = count;
     break;
   }
   case MSG_CMD_EXISTS: {
     struct kv_obj *v = shard_key_get(s, key, klen, cur);
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = v ? 1 : 0;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = v ? 1 : 0;
     break;
   }
   case MSG_CMD_TTL:
   case MSG_CMD_PTTL: {
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = shard_key_ttl(s, key, klen, cur, sub_op == MSG_CMD_PTTL);
+    reply_type = REPLY_TYPE_INT;
+    reply_int = shard_key_ttl(s, key, klen, cur, sub_op == MSG_CMD_PTTL);
     break;
   }
   case MSG_CMD_EXPIRE:
   case MSG_CMD_PEXPIRE: {
     if (cmd->argc < 3) {
-      msg->reply_buf = "wrong number of arguments";
-      msg->reply_len = 25;
+      reply_buf = "wrong number of arguments";
+      reply_len = 25;
       break;
     }
     char tmp[32] = {0};
@@ -571,20 +590,20 @@ dispatch:
                        ? (sub_op == MSG_CMD_EXPIRE ? cur + (uint64_t)n * 1000ULL
                                                    : cur + (uint64_t)n)
                        : 1;
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = shard_key_expire(s, key, klen, exp) ? 1 : 0;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = shard_key_expire(s, key, klen, exp) ? 1 : 0;
     break;
   }
   case MSG_CMD_PERSIST: {
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = shard_key_expire(s, key, klen, 0) ? 1 : 0;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = shard_key_expire(s, key, klen, 0) ? 1 : 0;
     break;
   }
   case MSG_CMD_EXPIREAT:
   case MSG_CMD_PEXPIREAT: {
     if (cmd->argc < 3) {
-      msg->reply_buf = "wrong number of arguments";
-      msg->reply_len = 25;
+      reply_buf = "wrong number of arguments";
+      reply_len = 25;
       break;
     }
     char tmp[32] = {0};
@@ -593,8 +612,8 @@ dispatch:
     long long n = strtoll(tmp, NULL, 10);
     uint64_t exp =
         (sub_op == MSG_CMD_EXPIREAT) ? (uint64_t)n * 1000ULL : (uint64_t)n;
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = shard_key_expire(s, key, klen, exp) ? 1 : 0;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = shard_key_expire(s, key, klen, exp) ? 1 : 0;
     break;
   }
   case MSG_CMD_INCR: {
@@ -608,8 +627,8 @@ dispatch:
       char tmp[32] = {0};
       uint32_t vl = obj_val_len_get(v);
       if (vl >= sizeof(tmp)) {
-        msg->reply_buf = "value is not an integer";
-        msg->reply_len = 23;
+        reply_buf = "value is not an integer";
+        reply_len = 23;
         break;
       }
       memcpy(tmp, obj_val_get(v), vl);
@@ -619,44 +638,35 @@ dispatch:
     char buf[32];
     int bl = snprintf(buf, sizeof(buf), "%lld", cur_val);
     shard_key_set(s, key, klen, buf, (size_t)bl, 0, HT_PUT_NONE);
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = cur_val;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = cur_val;
     break;
   }
   case MSG_CMD_MGET_PART: {
-    const char *pkey = (const char *)msg->key_ptr;
-    size_t pklen = msg->key_len;
+    const char *pkey = (const char *)msg->u.key_part_req.key_ptr;
+    size_t pklen = msg->u.key_part_req.key_len;
     struct kv_obj *v = shard_key_get(s, pkey, pklen, cur);
     if (v) {
       shard_obj_ref(v);
-      msg->kv_obj_ptr = v;
-      msg->reply_type = REPLY_TYPE_KV_OBJ;
+      kv_obj_ptr = v;
+      reply_type = REPLY_TYPE_KV_OBJ;
     } else {
-      msg->reply_type = REPLY_TYPE_NIL;
+      reply_type = REPLY_TYPE_NIL;
     }
     break;
   }
-  case MSG_CMD_MSET_PART: {
-    const char *pkey = (const char *)msg->key_ptr;
-    size_t pklen = msg->key_len;
-    const char *pval = (const char *)msg->val_ptr;
-    size_t pvlen = msg->val_len;
-    shard_key_set(s, pkey, pklen, pval, pvlen, 0, HT_PUT_NONE);
-    msg->reply_type = REPLY_TYPE_OK;
-    break;
-  }
   case MSG_CMD_DEL_PART: {
-    const char *pkey = (const char *)msg->key_ptr;
-    size_t pklen = msg->key_len;
+    const char *pkey = (const char *)msg->u.key_part_req.key_ptr;
+    size_t pklen = msg->u.key_part_req.key_len;
     bool deleted = shard_key_delete(s, pkey, pklen);
     char buf[8];
     int bl = snprintf(buf, sizeof(buf), ":%d\r\n", deleted ? 1 : 0);
     char *rb = (char *)slab_obj_alloc(s->pool, (size_t)bl);
     if (rb)
       memcpy(rb, buf, (size_t)bl);
-    msg->reply_buf = rb;
-    msg->reply_len = rb ? (uint32_t)bl : 0;
-    msg->reply_type = REPLY_TYPE_BUF;
+    reply_buf = rb;
+    reply_len = rb ? (uint32_t)bl : 0;
+    reply_type = REPLY_TYPE_BUF;
     break;
   }
   case MSG_CMD_TYPE: {
@@ -666,9 +676,9 @@ dispatch:
     char *rb = (char *)slab_obj_alloc(s->pool, rlen);
     if (rb)
       memcpy(rb, resp, rlen);
-    msg->reply_buf = rb;
-    msg->reply_len = rb ? (uint32_t)rlen : 0;
-    msg->reply_type = REPLY_TYPE_BUF;
+    reply_buf = rb;
+    reply_len = rb ? (uint32_t)rlen : 0;
+    reply_type = REPLY_TYPE_BUF;
     break;
   }
   case MSG_CMD_DBSIZE: {
@@ -676,31 +686,41 @@ dispatch:
     int bl = snprintf(buf, sizeof(buf), ":%lld\r\n", (long long)s->table->used);
     char *hdr = (char *)slab_obj_alloc(s->pool, (size_t)bl + 1);
     memcpy(hdr, buf, (size_t)bl);
-    msg->reply_buf = hdr;
-    msg->reply_len = (uint32_t)bl;
-    msg->reply_type = REPLY_TYPE_BUF;
+    reply_buf = hdr;
+    reply_len = (uint32_t)bl;
+    reply_type = REPLY_TYPE_BUF;
     break;
   }
   case MSG_CMD_STRLEN: {
     struct kv_obj *v = shard_key_get(s, key, klen, cur);
-    msg->reply_type = REPLY_TYPE_INT;
-    msg->reply_int = v ? (long long)obj_val_len_get(v) : 0;
+    reply_type = REPLY_TYPE_INT;
+    reply_int = v ? (long long)obj_val_len_get(v) : 0;
     break;
   }
   case MSG_CMD_MSET_PREPARE: {
     /* DEPRECATED — old synchronous MSET. Should not arrive anymore.
      * New protocol uses MSG_CMD_MSET_KEY handled in shard_msg_drain. */
-    msg->reply_type = REPLY_TYPE_ERR;
-    msg->reply_buf = "deprecated MSET_PREPARE";
-    msg->reply_len = 23;
+    reply_type = REPLY_TYPE_ERR;
+    reply_buf = "deprecated MSET_PREPARE";
+    reply_len = 23;
     break;
   }
   default:
-    msg->reply_buf = "unknown proxy cmd";
-    msg->reply_len = 17;
+    reply_buf = "unknown proxy cmd";
+    reply_len = 17;
     break;
   }
 
+finish:
+  msg->u.reply.conn_ptr = conn_ptr;
+  msg->u.reply.req_nb = req_nb;
+  msg->u.reply.kv_obj_ptr = kv_obj_ptr;
+  msg->u.reply.reply_buf = reply_buf;
+  msg->u.reply.reply_int = reply_int;
+  msg->u.reply.pipeline_idx = pipeline_idx;
+  msg->u.reply.sub_idx = sub_idx;
+  msg->u.reply.reply_len = reply_len;
+  msg->u.reply.reply_type = reply_type;
   return PROXY_EXEC_DONE;
 }
 
@@ -770,10 +790,10 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
       if (sys_op == MSG_SYS_RELEASE) {
         if (drain_prof)
           release_msgs++;
-        if (msg.kv_obj_ptr)
-          shard_obj_unref(shard, (struct kv_obj *)msg.kv_obj_ptr);
-        if (msg.reply_buf)
-          slab_obj_free(shard->pool, msg.reply_buf);
+        if (msg.u.release.kv_obj_ptr)
+          shard_obj_unref(shard, (struct kv_obj *)msg.u.release.kv_obj_ptr);
+        if (msg.u.release.reply_buf)
+          slab_obj_free(shard->pool, msg.u.release.reply_buf);
         continue;
       }
 
@@ -819,7 +839,9 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
           if (drain_prof)
             mset_batch_msgs++;
           uint32_t batch_count =
-              msg.key_ptr ? ((struct mset_batch *)msg.key_ptr)->count : 0;
+              msg.u.mset_prepare_batch.batch
+                  ? msg.u.mset_prepare_batch.batch->count
+                  : 0;
           mset_on_prepare_batch(engine, shard, &msg, cur);
           if (mix_prof) {
             uint64_t dur = PROF_NOW() - t_msg;
@@ -861,6 +883,11 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
           else
             other_req_msgs++;
         }
+        struct net_buf *req_nb = NULL;
+        if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART)
+          req_nb = msg.u.key_part_req.req_nb;
+        else if (cmd_op != MSG_CMD_DBSIZE)
+          req_nb = msg.u.regular_req.req_nb;
         enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
         if (mix_prof) {
           uint64_t dur = PROF_NOW() - t_msg;
@@ -876,8 +903,8 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
 
         shard->cross_shard_received++;
         if (exec_rc == PROXY_EXEC_DEFERRED) {
-          if (msg.req_nb)
-            net_buf_unref(shard->pool, msg.req_nb);
+          if (req_nb)
+            net_buf_unref(shard->pool, req_nb);
           continue;
         }
 
@@ -888,17 +915,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
         struct spsc_message reply = {
             .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
             .shard_owner = (uint8_t)shard->id,
-            .conn_ptr = msg.conn_ptr,
-            .conn_generation = msg.conn_generation,
-            .pipeline_idx = msg.pipeline_idx,
-            .sub_idx = msg.sub_idx,
-            .kv_obj_ptr = msg.kv_obj_ptr,
-            .old_obj_ptr = msg.old_obj_ptr,
-            .reply_buf = msg.reply_buf,
-            .reply_len = msg.reply_len,
-            .reply_type = msg.reply_type,
-            .reply_int = msg.reply_int,
-            .req_nb = msg.req_nb,
+            .u.reply = msg.u.reply,
         };
         while (true) {
           if (spsc_queue_push(rq, &reply)) {

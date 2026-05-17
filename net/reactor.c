@@ -338,8 +338,10 @@ static void net_remote_obj_release(struct reactor *r, uint8_t owner_shard,
 
   struct spsc_message rel = {.op = MSG_PACK_OP(MSG_SYS_RELEASE, 0),
                              .shard_owner = (uint8_t)r->shard->id,
-                             .kv_obj_ptr = kv_obj_ptr,
-                             .reply_buf = reply_buf};
+                             .u.release = {
+                                 .kv_obj_ptr = kv_obj_ptr,
+                                 .reply_buf = reply_buf,
+                             }};
   struct spsc_queue *rq =
       &r->engine->queues[r->shard->id * r->engine->num_shards + owner_shard];
   /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
@@ -916,8 +918,8 @@ static void net_reactor_proxy_reply_callback(void *ctx,
     /* Mark dirty: mset_on_ack may have set +OK reply locally (if local
      * coordinator processed the last FIN key).  If FINs are still pending,
      * the slot is PSLOT_PENDING and the flush is a safe no-op. */
-    struct net_conn *c = (struct net_conn *)msg->conn_ptr;
-    if (c && c->generation == msg->conn_generation)
+    struct net_conn *c = (struct net_conn *)msg->u.mset_ack.conn_ptr;
+    if (c)
       net_reactor_mark_dirty_reason(r, c, "mset_ack");
     return;
   }
@@ -926,47 +928,41 @@ static void net_reactor_proxy_reply_callback(void *ctx,
     mset_on_fin_ack(r->engine, r->shard, (struct spsc_message *)msg);
     mset_pending_conn_drain(r, 8);
     /* +OK reply is now set in the pipeline slot — flush to client */
-    struct net_conn *c = (struct net_conn *)msg->conn_ptr;
-    if (c && c->generation == msg->conn_generation)
+    struct mset_stat *stat = msg->u.mset_stat.stat;
+    struct net_conn *c = stat ? (struct net_conn *)stat->conn_ptr : NULL;
+    if (c && c->generation == stat->conn_generation)
       net_reactor_mark_dirty_reason(r, c, "mset_fin_ack");
     return;
   }
 
-  if (msg->req_nb)
-    net_buf_unref(r->shard->pool, msg->req_nb);
+  if (msg->u.reply.req_nb)
+    net_buf_unref(r->shard->pool, msg->u.reply.req_nb);
 
-  struct net_conn *c = (struct net_conn *)msg->conn_ptr;
+  struct net_conn *c = (struct net_conn *)msg->u.reply.conn_ptr;
   if (!c) {
-    net_remote_obj_release(r, msg->shard_owner, msg->kv_obj_ptr,
-                           msg->reply_buf);
-    return;
-  }
-
-  /* Stale reply check — generation only, no state check needed */
-  if (c->generation != msg->conn_generation) {
-    net_remote_obj_release(r, msg->shard_owner, msg->kv_obj_ptr,
-                           msg->reply_buf);
+    net_remote_obj_release(r, msg->shard_owner, msg->u.reply.kv_obj_ptr,
+                           msg->u.reply.reply_buf);
     return;
   }
 
   struct net_proxy_pipeline *pp = &c->proxy;
-  uint32_t seq = msg->pipeline_idx;
+  uint32_t seq = msg->u.reply.pipeline_idx;
 
   /* Bounds check: seq must be in [out, in) using signed diff for uint32 wrap */
   if ((int32_t)(seq - pp->out) < 0 || (int32_t)(seq - pp->in) >= 0) {
-    net_remote_obj_release(r, msg->shard_owner, msg->kv_obj_ptr,
-                           msg->reply_buf);
+    net_remote_obj_release(r, msg->shard_owner, msg->u.reply.kv_obj_ptr,
+                           msg->u.reply.reply_buf);
     return;
   }
 
   struct net_pipeline_slot *slot = &pp->slots[seq & (pp->cap - 1)];
   if (slot->is_multi) {
-    uint32_t sidx = msg->sub_idx;
+    uint32_t sidx = msg->u.reply.sub_idx;
     if (sidx < slot->multi_parts) {
-      slot->multi_replies[sidx] = (uint8_t *)msg->reply_buf;
-      slot->multi_reply_lens[sidx] = msg->reply_len;
+      slot->multi_replies[sidx] = (uint8_t *)msg->u.reply.reply_buf;
+      slot->multi_reply_lens[sidx] = msg->u.reply.reply_len;
       if (slot->multi_kv_objs)
-        slot->multi_kv_objs[sidx] = msg->kv_obj_ptr;
+        slot->multi_kv_objs[sidx] = msg->u.reply.kv_obj_ptr;
       if (slot->multi_owners)
         slot->multi_owners[sidx] = msg->shard_owner;
       slot->multi_replied++;
@@ -977,11 +973,12 @@ static void net_reactor_proxy_reply_callback(void *ctx,
   } else {
     /* Zero-malloc path: copy reply type/int directly into slot,
      * only reply_data for ERR/BUF which point to static literals. */
-    slot->reply_type = msg->reply_type;
-    slot->reply_int = msg->reply_int;
-    slot->reply_data = (uint8_t *)msg->reply_buf; /* static literal or NULL */
-    slot->reply_len = msg->reply_len;
-    slot->kv_obj_ptr = msg->kv_obj_ptr;
+    slot->reply_type = msg->u.reply.reply_type;
+    slot->reply_int = msg->u.reply.reply_int;
+    slot->reply_data =
+        (uint8_t *)msg->u.reply.reply_buf; /* static literal or NULL */
+    slot->reply_len = msg->u.reply.reply_len;
+    slot->kv_obj_ptr = msg->u.reply.kv_obj_ptr;
     slot->shard_owner = msg->shard_owner;
     slot->state = PSLOT_DONE;
   }

@@ -452,24 +452,25 @@ static void mset_complete_regular_reply(struct shard_engine *engine,
   uint16_t cmd_op = MSG_GET_CMD(ci->msg.op);
 
   if (ci->origin_shard == shard->id) {
-    struct net_conn *c = (struct net_conn *)ci->msg.conn_ptr;
-    if (!c || c->generation != ci->msg.conn_generation) {
-      if (ci->msg.kv_obj_ptr)
-        shard_obj_unref(shard, (struct kv_obj *)ci->msg.kv_obj_ptr);
-      if (ci->msg.reply_type == REPLY_TYPE_BUF && ci->msg.reply_buf)
-        slab_obj_free(shard->pool, ci->msg.reply_buf);
+    struct net_conn *c = (struct net_conn *)ci->msg.u.reply.conn_ptr;
+    if (!c) {
+      if (ci->msg.u.reply.kv_obj_ptr)
+        shard_obj_unref(shard, (struct kv_obj *)ci->msg.u.reply.kv_obj_ptr);
+      if (ci->msg.u.reply.reply_type == REPLY_TYPE_BUF &&
+          ci->msg.u.reply.reply_buf)
+        slab_obj_free(shard->pool, ci->msg.u.reply.reply_buf);
       return;
     }
 
     struct net_pipeline_slot *slot =
-        &c->proxy.slots[ci->msg.pipeline_idx & (c->proxy.cap - 1)];
+        &c->proxy.slots[ci->msg.u.reply.pipeline_idx & (c->proxy.cap - 1)];
     if (slot->is_multi) {
-      uint32_t sidx = ci->msg.sub_idx;
+      uint32_t sidx = ci->msg.u.reply.sub_idx;
       if (sidx < slot->multi_parts) {
-        slot->multi_replies[sidx] = (uint8_t *)ci->msg.reply_buf;
-        slot->multi_reply_lens[sidx] = ci->msg.reply_len;
+        slot->multi_replies[sidx] = (uint8_t *)ci->msg.u.reply.reply_buf;
+        slot->multi_reply_lens[sidx] = ci->msg.u.reply.reply_len;
         if (slot->multi_kv_objs)
-          slot->multi_kv_objs[sidx] = ci->msg.kv_obj_ptr;
+          slot->multi_kv_objs[sidx] = ci->msg.u.reply.kv_obj_ptr;
         if (slot->multi_owners)
           slot->multi_owners[sidx] = (uint8_t)shard->id;
         slot->multi_replied++;
@@ -477,11 +478,11 @@ static void mset_complete_regular_reply(struct shard_engine *engine,
           slot->state = PSLOT_DONE;
       }
     } else {
-      slot->reply_type = ci->msg.reply_type;
-      slot->reply_int = ci->msg.reply_int;
-      slot->reply_data = (uint8_t *)ci->msg.reply_buf;
-      slot->reply_len = ci->msg.reply_len;
-      slot->kv_obj_ptr = ci->msg.kv_obj_ptr;
+      slot->reply_type = ci->msg.u.reply.reply_type;
+      slot->reply_int = ci->msg.u.reply.reply_int;
+      slot->reply_data = (uint8_t *)ci->msg.u.reply.reply_buf;
+      slot->reply_len = ci->msg.u.reply.reply_len;
+      slot->kv_obj_ptr = ci->msg.u.reply.kv_obj_ptr;
       slot->shard_owner = (uint8_t)shard->id;
       slot->state = PSLOT_DONE;
     }
@@ -495,17 +496,7 @@ static void mset_complete_regular_reply(struct shard_engine *engine,
   struct spsc_message reply = {
       .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
       .shard_owner = (uint8_t)shard->id,
-      .conn_ptr = ci->msg.conn_ptr,
-      .conn_generation = ci->msg.conn_generation,
-      .pipeline_idx = ci->msg.pipeline_idx,
-      .sub_idx = ci->msg.sub_idx,
-      .kv_obj_ptr = ci->msg.kv_obj_ptr,
-      .old_obj_ptr = ci->msg.old_obj_ptr,
-      .reply_buf = ci->msg.reply_buf,
-      .reply_len = ci->msg.reply_len,
-      .reply_type = ci->msg.reply_type,
-      .reply_int = ci->msg.reply_int,
-      .req_nb = ci->msg.req_nb,
+      .u.reply = ci->msg.u.reply,
   };
   send_to_shard(engine, shard->id, ci->origin_shard, &reply);
   ci->req_nb = NULL; /* reply now owns the request-buffer ref */
@@ -546,7 +537,7 @@ static void mset_mixed_log_set_drain(struct shard *shard, struct cmd_info *ci,
             "[MSET_MIXED_SET_DRAIN] ts_ms=%lu shard=%u cmd=%s origin=%u "
             "pidx=%u waitcy=%lu execcy=%lu deferred_again=%d\n",
             (unsigned long)now_ms(), sid, mixed_cmd_name(cmd_op),
-            ci->origin_shard, ci->msg.pipeline_idx,
+            ci->origin_shard, ci->msg.u.reply.pipeline_idx,
             (unsigned long)wait_cycles, (unsigned long)exec_cycles,
             exec_rc == PROXY_EXEC_DEFERRED);
   }
@@ -578,13 +569,12 @@ static void mset_reanchor_lock_after_regular(struct shard *shard,
   const void *key = NULL;
   size_t klen = 0;
 
-  if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_MSET_PART ||
-      cmd_op == MSG_CMD_DEL_PART) {
-    key = msg->key_ptr;
-    klen = msg->key_len;
-  } else if (msg->cmd.argc > 1) {
-    key = msg->cmd.argv[1];
-    klen = msg->cmd.arglen[1];
+  if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART) {
+    key = msg->u.key_part_req.key_ptr;
+    klen = msg->u.key_part_req.key_len;
+  } else if (msg->u.regular_req.cmd.argc > 1) {
+    key = msg->u.regular_req.cmd.argv[1];
+    klen = msg->u.regular_req.cmd.arglen[1];
   }
 
   if (!key || !klen)
@@ -821,10 +811,10 @@ static struct mset_stat *try_send_ack(struct shard_engine *engine,
   struct spsc_message ack = {
       .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_ACK),
       .shard_owner = (uint8_t)shard->id,
-      .conn_ptr = stat->conn_ptr,
-      .conn_generation = stat->conn_generation,
-      .pipeline_idx = stat->pipeline_idx,
-      .kv_obj_ptr = stat,
+      .u.mset_ack = {
+          .conn_ptr = stat->conn_ptr,
+          .pipeline_idx = stat->pipeline_idx,
+      },
   };
   send_to_shard(engine, shard->id, stat->coordinator_id, &ack);
   
@@ -905,8 +895,7 @@ static void mset_send_fin_to_remotes(struct shard_engine *engine,
     struct spsc_message fin = {
         .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_FIN),
         .shard_owner = (uint8_t)my_id,
-        .pipeline_idx = stat->pipeline_idx,
-        .kv_obj_ptr = stat,
+        .u.mset_stat.stat = stat,
     };
     MSET_DBG_STORE(stat->dbg_send_fin_remote_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "send_fin_remote", now_ms(), sid);
@@ -1419,10 +1408,7 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
           struct spsc_message fack = {
               .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_FIN_ACK),
               .shard_owner = (uint8_t)shard->id,
-              .conn_ptr = stat->conn_ptr,
-              .conn_generation = stat->conn_generation,
-              .pipeline_idx = stat->pipeline_idx,
-              .kv_obj_ptr = stat,
+              .u.mset_stat.stat = stat,
           };
           MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
           mset_debug_lifecycle(shard, stat, "send_fin_ack", now_ms(),
@@ -1557,10 +1543,7 @@ static bool mset_try_early_commit(struct shard_engine *engine,
     struct spsc_message fack = {
         .op              = MSG_PACK_OP(MSG_SYS_REPLY, MSG_CMD_MSET_FIN_ACK),
         .shard_owner     = (uint8_t)shard->id,
-        .conn_ptr        = stat->conn_ptr,
-        .conn_generation = stat->conn_generation,
-        .pipeline_idx    = stat->pipeline_idx,
-        .kv_obj_ptr      = stat,
+        .u.mset_stat.stat = stat,
     };
     MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "early_send_fin_ack", now_ms(),
@@ -1578,25 +1561,16 @@ static bool mset_try_early_commit(struct shard_engine *engine,
  * Returns mset_stat* if coordinator is local and all keys are now ready.
  * Returns NULL otherwise (waiting for remote ACKs or in wait queue).
  */
-static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
-                                          struct shard *shard,
-                                          struct spsc_message *msg,
-                                          uint64_t cur_ms) {
+static struct mset_stat *
+mset_prepare_key(struct shard_engine *engine, struct shard *shard,
+                 const char *key, size_t klen, const char *val, size_t vlen,
+                 struct mset_stat *stat, uint32_t sub_idx,
+                 uint8_t origin_shard, uint64_t cur_ms) {
   uint64_t start_cycles = PROF_NOW();
   struct lock_manager *lm = &shard->lm;
   struct slab_allocator *pool = shard->pool;
 
-  const char *key = (const char *)msg->key_ptr;
-  size_t klen = msg->key_len;
-  const char *val = (const char *)msg->val_ptr;
-  size_t vlen = msg->val_len;
-  struct mset_stat *stat = (struct mset_stat *)msg->kv_obj_ptr;
-
-  struct txn_id txn = {
-      .timestamp_ns = (uint64_t)msg->reply_int,
-      .conn_ptr = msg->conn_ptr,
-      .pipeline_idx = msg->pipeline_idx,
-  };
+  struct txn_id txn = stat->txn;
 
   uint64_t meta = ht_meta_pack(ht_key_hash(key, klen), VAL_TYPE_STRING);
   uint64_t hash56 = meta >> 8;
@@ -1680,7 +1654,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
 
       shard_obj_destroy(shard, old_new_obj);
       incumbent->new_obj = new_obj;
-      incumbent->sub_idx = msg->sub_idx;
+      incumbent->sub_idx = sub_idx;
       incumbent->total_acks++;   /* this raw pair will be counted at FIN */
       shard->ops_completed++;
       PROF_RECORD(shard->prof.mset_prepare, start_cycles);
@@ -1716,7 +1690,7 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
       if (old_tentative)
         shard_obj_destroy(shard, old_tentative);
       dup_cmd->new_obj = new_obj;
-      dup_cmd->sub_idx = msg->sub_idx;
+      dup_cmd->sub_idx = sub_idx;
       dup_cmd->total_acks++;     /* this raw pair will be counted at FIN */
       shard->ops_completed++;
       PROF_RECORD(shard->prof.mset_prepare, start_cycles);
@@ -1751,9 +1725,9 @@ static struct mset_stat *mset_prepare_key(struct shard_engine *engine,
   cmd->stat = stat;
   cmd->new_obj = new_obj;
   cmd->old_obj = obj_ptr;      /* NULL for new keys */
-  cmd->sub_idx = msg->sub_idx;
+  cmd->sub_idx = sub_idx;
   cmd->total_acks = 1;         /* counts raw pairs; incremented by duplicates */
-  cmd->origin_shard = msg->shard_owner;
+  cmd->origin_shard = origin_shard;
   cmd->req_nb = NULL;
   cmd->hash56 = hash56;
 
@@ -2273,23 +2247,12 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
     uint32_t target = shard_for_key(key, klen, nshards);
 
     if (target == my_id) {
-      struct spsc_message msg = {
-          .op              = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_KEY),
-          .shard_owner     = (uint8_t)my_id,
-          .conn_ptr        = c,
-          .conn_generation = c->generation,
-          .pipeline_idx    = pipeline_seq,
-          .sub_idx         = i,
-          .key_ptr         = (void *)key,
-          .key_len         = (uint32_t)klen,
-          .val_ptr         = (void *)val,
-          .val_len         = (uint32_t)vlen,
-          .req_nb          = req_nb,
-          .reply_int       = (int64_t)txn_ts,
-          .kv_obj_ptr      = stat,
-      };
       uint64_t t_local = PROF_NOW();
-      mset_on_prepare(engine, r->shard, &msg, now_ms());
+      struct mset_stat *ready =
+          mset_prepare_key(engine, r->shard, key, klen, val, vlen, stat, i,
+                           (uint8_t)my_id, now_ms());
+      if (ready)
+        mset_broadcast_fin(engine, r->shard, ready);
       PROF_RECORD(r->shard->prof.coord_local_exec, t_local);
     } else {
       uint32_t idx = counts[target]++;              /* O(1) — stack array  */
@@ -2307,12 +2270,10 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
     struct spsc_message bmsg = {
         .op              = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_KEY_BATCH),
         .shard_owner     = (uint8_t)my_id,
-        .conn_ptr        = c,
-        .conn_generation = c->generation,
-        .pipeline_idx    = pipeline_seq,
-        .key_ptr         = batch_ptrs[sid], /* points to mset_batch header  */
-        .reply_int       = (int64_t)txn_ts,
-        .kv_obj_ptr      = stat,
+        .u.mset_prepare_batch = {
+            .batch = batch_ptrs[sid],
+            .stat = stat,
+        },
     };
     struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
     uint64_t t2 = PROF_NOW();
@@ -2346,10 +2307,10 @@ static int mset_coordinator_dispatch_argv(struct reactor *r,
 
 void mset_on_prepare(struct shard_engine *engine, struct shard *shard,
                      struct spsc_message *msg, uint64_t cur_ms) {
-  struct mset_stat *ready = mset_prepare_key(engine, shard, msg, cur_ms);
-  if (ready) {
-    mset_broadcast_fin(engine, shard, ready);
-  }
+  (void)engine;
+  (void)shard;
+  (void)msg;
+  (void)cur_ms;
 }
 
 /* ── mset_on_prepare_batch: entry point for MSG_CMD_MSET_KEY_BATCH ──── */
@@ -2359,7 +2320,8 @@ void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
 #if FREAKV_PROFILE
   PROF_RECORD(shard->prof.mset_prepare_queue_latency, msg->sent_cycles);
 #endif
-  struct mset_batch *batch = (struct mset_batch *)msg->key_ptr;
+  struct mset_batch *batch = msg->u.mset_prepare_batch.batch;
+  struct mset_stat *stat = msg->u.mset_prepare_batch.stat;
   bool mix_prof = mixed_profile_enabled();
   uint64_t batch_start = mix_prof ? PROF_NOW() : 0;
   uint64_t max_entry_cycles = 0;
@@ -2369,22 +2331,11 @@ void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
       mix_prof && shard->id < MAX_SHARDS ? mixed_early_commit_count[shard->id] : 0;
 
   for (uint32_t i = 0; i < batch->count; i++) {
-    struct spsc_message key_msg = {
-        .op              = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MSET_KEY),
-        .shard_owner     = msg->shard_owner,
-        .conn_ptr        = msg->conn_ptr,
-        .conn_generation = msg->conn_generation,
-        .pipeline_idx    = msg->pipeline_idx,
-        .sub_idx         = batch->entries[i].sub_idx,
-        .key_ptr         = (void *)batch->entries[i].key,
-        .key_len         = (uint32_t)batch->entries[i].klen,
-        .val_ptr         = (void *)batch->entries[i].val,
-        .val_len         = (uint32_t)batch->entries[i].vlen,
-        .reply_int       = msg->reply_int,  /* txn_ts */
-        .kv_obj_ptr      = msg->kv_obj_ptr, /* stat   */
-    };
     uint64_t entry_start = mix_prof ? PROF_NOW() : 0;
-    struct mset_stat *ready = mset_prepare_key(engine, shard, &key_msg, cur_ms);
+    struct mset_stat *ready = mset_prepare_key(
+        engine, shard, batch->entries[i].key, batch->entries[i].klen,
+        batch->entries[i].val, batch->entries[i].vlen, stat,
+        batch->entries[i].sub_idx, msg->shard_owner, cur_ms);
     if (ready) {
       ready_count++;
       mset_broadcast_fin(engine, shard, ready);
@@ -2419,7 +2370,7 @@ void mset_on_prepare_batch(struct shard_engine *engine, struct shard *shard,
 
 void mset_on_fin(struct shard_engine *engine, struct shard *shard,
                  struct spsc_message *msg, uint64_t cur_ms) {
-  struct mset_stat *stat = (struct mset_stat *)msg->kv_obj_ptr;
+  struct mset_stat *stat = msg->u.mset_stat.stat;
   if (!stat)
     return;
   MSET_DBG_STORE(stat->dbg_on_fin_ms, cur_ms);
@@ -2441,12 +2392,11 @@ void mset_on_ack(struct shard_engine *engine, struct shard *shard,
   PROF_RECORD(shard->prof.mset_ack_queue_latency, ack_msg->sent_cycles);
 #endif
   uint64_t start_cycles = PROF_NOW();
-  struct net_conn *c = (struct net_conn *)ack_msg->conn_ptr;
-
-  if (!c || c->generation != ack_msg->conn_generation)
+  struct net_conn *c = (struct net_conn *)ack_msg->u.mset_ack.conn_ptr;
+  if (!c)
     return;
 
-  uint32_t pidx = ack_msg->pipeline_idx;
+  uint32_t pidx = ack_msg->u.mset_ack.pipeline_idx;
   struct net_pipeline_slot *ps = &c->proxy.slots[pidx & (c->proxy.cap - 1)];
 
   struct mset_stat *stat = (struct mset_stat *)ps->kv_obj_ptr;
@@ -2480,7 +2430,7 @@ void mset_on_fin_ack(struct shard_engine *engine, struct shard *shard,
                      struct spsc_message *msg) {
   (void)engine;
   uint64_t start_cycles = PROF_NOW();
-  struct mset_stat *stat = (struct mset_stat *)msg->kv_obj_ptr;
+  struct mset_stat *stat = msg->u.mset_stat.stat;
   if (!stat)
     return;
 
@@ -2595,7 +2545,11 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
   cmd->defer_cycles = PROF_NOW();
 #endif
   cmd->origin_shard = msg->shard_owner;
-  cmd->req_nb = msg->req_nb;
+  uint16_t req_cmd_op = MSG_GET_CMD(msg->op);
+  if (req_cmd_op == MSG_CMD_MGET_PART || req_cmd_op == MSG_CMD_DEL_PART)
+    cmd->req_nb = msg->u.key_part_req.req_nb;
+  else
+    cmd->req_nb = msg->u.regular_req.req_nb;
   if (cmd->req_nb)
     net_buf_ref(cmd->req_nb);
 
@@ -2618,7 +2572,11 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
                 "[MSET_MIXED_SET_DEFER] ts_ms=%lu shard=%u cmd=%s origin=%u "
                 "pidx=%u inbox_qcy=%lu lock_hits=%lu deferred=%lu\n",
                 (unsigned long)cur_ms, shard->id, mixed_cmd_name(cmd_op),
-                cmd->origin_shard, msg->pipeline_idx, (unsigned long)inbox_q,
+                cmd->origin_shard,
+                cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART
+                    ? msg->u.key_part_req.pipeline_idx
+                    : msg->u.regular_req.pipeline_idx,
+                (unsigned long)inbox_q,
                 (unsigned long)lock_hits[shard->id],
                 (unsigned long)lock_deferred[shard->id]);
       }
