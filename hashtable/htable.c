@@ -135,8 +135,12 @@ struct hash_table *ht_table_create(struct thread_heap *heap, uint32_t thread_id,
     return NULL;
   memset(ht, 0, sizeof(*ht));
 
-  /* Partition thread's arena_base region: 50% HT, 50% OVF */
-  size_t arena_half = g_mem_arena.per_thread_arena_size / 2;
+  /* Partition thread's arena_base region: HT/OVF, leaving a tail slice for
+   * control-plane data that should live with the data-plane linear memory. */
+  size_t usable_arena = g_mem_arena.per_thread_arena_size;
+  if (usable_arena > ARENA_LINEAR_CTRL_RESERVE)
+    usable_arena -= ARENA_LINEAR_CTRL_RESERVE;
+  size_t arena_half = usable_arena / 2;
   void *ht_base = (void *)thread_arena_base(thread_id);
   void *ovf_base = (char *)ht_base + arena_half;
 

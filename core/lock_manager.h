@@ -15,6 +15,7 @@
 
 #include "txn.h"
 #include "../memory/slab.h"
+#include "../mem/mem_linear.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -67,6 +68,7 @@ struct lock_manager {
     uint32_t capacity;            /* always LOCK_TABLE_CAPACITY            */
     uint32_t num_shards;          /* for open_groups sizing                */
     struct slab_allocator *pool;  /* control-plane allocator               */
+    struct linear_arena arena;    /* entries/ctrl storage in linear memory */
 };
 
 /* ── API ─────────────────────────────────────────────────────────────── */

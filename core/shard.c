@@ -970,6 +970,16 @@ static bool shard_local_init(struct shard *shard, uint32_t id, int cpu_core,
     mem_thread_destroy(id);
     return false;
   }
+  const size_t control_hot_sizes[] = {
+      sizeof(struct net_conn),
+      sizeof(struct net_buf) + 4096,
+      PIPELINE_INIT_CAP * sizeof(struct net_pipeline_slot),
+      sizeof(char *) * 8,
+      sizeof(size_t) * 8,
+      256,
+  };
+  slab_alloc_prewarm(shard->pool, control_hot_sizes,
+                     sizeof(control_hot_sizes) / sizeof(control_hot_sizes[0]));
 
   if (!lock_manager_init(&shard->lm, num_shards, shard->pool)) {
     slab_alloc_destroy(shard->pool);

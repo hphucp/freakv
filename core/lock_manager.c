@@ -1,4 +1,6 @@
 #include "lock_manager.h"
+#include "../mem/mem_arena.h"
+#include "../mem/mem_api.h"
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -105,15 +107,26 @@ bool lock_manager_init(struct lock_manager *lm, uint32_t num_shards,
     lm->num_shards = num_shards;
     lm->pool = pool;
 
-    lm->entries = (struct lock_entry *)slab_obj_calloc(
-        pool, LOCK_TABLE_CAPACITY, sizeof(struct lock_entry));
+    uintptr_t base = thread_arena_base(mem_get_thread_id()) +
+                     g_mem_arena.per_thread_arena_size -
+                     ARENA_LINEAR_CTRL_RESERVE;
+    if (!linear_arena_init_manual(&lm->arena, mem_get_thread_id(),
+                                  (void *)base, ARENA_LINEAR_CTRL_RESERVE))
+        return false;
+    linear_arena_set_accounting(&lm->arena, false);
+
+    lm->entries = (struct lock_entry *)linear_arena_alloc(
+        &lm->arena, LOCK_TABLE_CAPACITY * sizeof(struct lock_entry),
+        _Alignof(struct lock_entry));
     if (!lm->entries)
         return false;
+    memset(lm->entries, 0, LOCK_TABLE_CAPACITY * sizeof(struct lock_entry));
 
-    lm->ctrl = (uint8_t *)slab_obj_alloc(
-        pool, LOCK_TABLE_CAPACITY + LOCK_TABLE_GROUP_SIZE);
+    lm->ctrl = (uint8_t *)linear_arena_alloc(
+        &lm->arena, LOCK_TABLE_CAPACITY + LOCK_TABLE_GROUP_SIZE,
+        _Alignof(uint8_t));
     if (!lm->ctrl) {
-        slab_obj_free(pool, lm->entries);
+        linear_arena_destroy(&lm->arena);
         memset(lm, 0, sizeof(*lm));
         return false;
     }
@@ -134,9 +147,7 @@ void lock_manager_destroy(struct lock_manager *lm) {
             slab_obj_free(lm->pool, le->open_groups);
     }
 
-    if (lm->ctrl)
-        slab_obj_free(lm->pool, lm->ctrl);
-    slab_obj_free(lm->pool, lm->entries);
+    linear_arena_destroy(&lm->arena);
     lm->ctrl = NULL;
     lm->entries = NULL;
     lm->count = 0;

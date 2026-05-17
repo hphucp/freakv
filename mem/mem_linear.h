@@ -18,6 +18,7 @@ struct linear_arena {
   size_t reserved;  /* Total VA reserved */
   size_t committed; /* Physical memory committed */
   size_t used;      /* Bump pointer offset */
+  bool account_usage; /* Count committed bytes toward heap linear usage */
 };
 
 /**
@@ -42,6 +43,8 @@ bool linear_arena_init_manual(struct linear_arena *arena, uint32_t thread_id,
  */
 bool linear_arena_init(struct linear_arena *arena, uint32_t thread_id);
 
+void linear_arena_set_accounting(struct linear_arena *arena, bool enabled);
+
 /**
  * Grow arena to new total size.
  * Commits additional physical pages as needed.
@@ -59,6 +62,16 @@ bool linear_arena_grow(struct linear_arena *arena, size_t new_total_bytes);
  * @return Base pointer
  */
 void *linear_arena_base(struct linear_arena *arena);
+
+/**
+ * Allocate from the arena's bump pointer.
+ *
+ * @param arena Arena structure
+ * @param size Number of bytes to allocate
+ * @param align Power-of-two alignment, or 0 for pointer alignment
+ * @return Allocated pointer, or NULL on failure
+ */
+void *linear_arena_alloc(struct linear_arena *arena, size_t size, size_t align);
 
 /**
  * Reset arena to initial state (used = 0).

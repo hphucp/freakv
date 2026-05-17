@@ -26,6 +26,7 @@ bool linear_arena_init_manual(struct linear_arena *arena, uint32_t thread_id,
   arena->reserved = reserved;
   arena->committed = 0;
   arena->used = 0;
+  arena->account_usage = true;
 
   return true;
 }
@@ -34,6 +35,11 @@ bool linear_arena_init(struct linear_arena *arena, uint32_t thread_id) {
   return linear_arena_init_manual(arena, thread_id,
                                   (void *)thread_arena_base(thread_id),
                                   g_mem_arena.per_thread_arena_size);
+}
+
+void linear_arena_set_accounting(struct linear_arena *arena, bool enabled) {
+  if (arena)
+    arena->account_usage = enabled;
 }
 
 bool linear_arena_grow(struct linear_arena *arena, size_t new_total_bytes) {
@@ -53,14 +59,15 @@ bool linear_arena_grow(struct linear_arena *arena, size_t new_total_bytes) {
   struct thread_heap *heap = &g_thread_heaps[arena->thread_id];
   size_t current_usage = heap->data_committed + heap->linear_committed;
 
-  if (heap->limit_bytes > 0 &&
+  if (arena->account_usage && heap->limit_bytes > 0 &&
       current_usage + grow_bytes > heap->limit_bytes) {
     fprintf(stderr, "[mem_linear] OOM: limit=%zu current=%zu grow=%zu\n",
             heap->limit_bytes, current_usage, grow_bytes);
     return false;
   }
 
-  size_t allowed = mem_barrier_allowed_bytes(grow_bytes);
+  size_t allowed = arena->account_usage ? mem_barrier_allowed_bytes(grow_bytes)
+                                        : grow_bytes;
   if (allowed < grow_bytes) {
     if (heap->evict_fn) {
       size_t freed = heap->evict_fn(heap->evict_ctx, grow_bytes);
@@ -103,12 +110,34 @@ bool linear_arena_grow(struct linear_arena *arena, size_t new_total_bytes) {
   }
 
   arena->committed = aligned;
-  heap->linear_committed += grow_bytes;
+  if (arena->account_usage)
+    heap->linear_committed += grow_bytes;
 
   return true;
 }
 
 void *linear_arena_base(struct linear_arena *arena) { return arena->base; }
+
+void *linear_arena_alloc(struct linear_arena *arena, size_t size, size_t align) {
+  if (!arena || size == 0)
+    return NULL;
+  if (align == 0)
+    align = sizeof(void *);
+  if ((align & (align - 1)) != 0)
+    return NULL;
+
+  size_t aligned_used = (arena->used + align - 1) & ~(align - 1);
+  if (aligned_used < arena->used || size > arena->reserved - aligned_used)
+    return NULL;
+
+  size_t end = aligned_used + size;
+  if (!linear_arena_grow(arena, end))
+    return NULL;
+
+  void *ptr = arena->base + aligned_used;
+  arena->used = end;
+  return ptr;
+}
 
 void linear_arena_reset(struct linear_arena *arena) { arena->used = 0; }
 
@@ -117,7 +146,8 @@ void linear_arena_destroy(struct linear_arena *arena) {
     if (madvise(arena->base, arena->committed, MADV_DONTNEED) < 0) {
       perror("[mem_linear] madvise MADV_DONTNEED");
     }
-    if (g_thread_heaps && arena->thread_id < g_mem_arena.n_threads) {
+    if (arena->account_usage && g_thread_heaps &&
+        arena->thread_id < g_mem_arena.n_threads) {
       struct thread_heap *heap = &g_thread_heaps[arena->thread_id];
       if (heap->linear_committed >= arena->committed)
         heap->linear_committed -= arena->committed;

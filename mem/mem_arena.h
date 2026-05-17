@@ -21,6 +21,7 @@
 /* 2^32 bucket slots * 32 bytes. This is reserved per shard with
  * MAP_NORESERVE; physical pages are committed only as the HT/OVF arenas grow. */
 #define ARENA_LINEAR_RESERVE (1ULL << 37) /* 128GiB per linear arena slice */
+#define ARENA_LINEAR_CTRL_RESERVE (64ULL << 20) /* tail slice for control-plane linear data */
 
 /* ── Global VA layout ────────────────────────────────────────────────── */
 
