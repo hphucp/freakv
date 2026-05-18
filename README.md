@@ -215,8 +215,9 @@ The commands below use memtier's thread/client model:
 
 - `-t 60` means 60 client-side memtier threads.
 - `-c 20` means 20 client connections per thread.
-- `-c 5 --pipeline=10` means fewer connections but 10 in-flight requests per
-  connection.
+- `--pipeline=10` means 10 in-flight requests per connection.
+- The additional SET-only stress run uses `-t 32 -c 60`, or 32 client-side
+  memtier threads with 60 client connections per thread.
 
 No preload step was used for the SET/GET cache-mode comparison. The GET tests
 ran after the SET tests in the same server session, so the measured GET workload
@@ -236,12 +237,12 @@ memtier_benchmark -s $SERVER --ratio 0:1 -t 60 -c 20 -n 200000 \
   --print-percentiles=50,99,99.9,100
 
 # SET, pipeline 10
-memtier_benchmark -s $SERVER --ratio 1:0 -t 60 -c 5 -n 2000000 \
+memtier_benchmark -s $SERVER --ratio 1:0 -t 60 -c 20 -n 2000000 \
   --distinct-client-seed --hide-histogram --pipeline=10 \
   --print-percentiles=50,99,99.9,100
 
 # GET, pipeline 10
-memtier_benchmark -s $SERVER --ratio 0:1 -t 60 -c 5 -n 2000000 \
+memtier_benchmark -s $SERVER --ratio 0:1 -t 60 -c 20 -n 2000000 \
   --distinct-client-seed --hide-histogram --pipeline=10 \
   --print-percentiles=50,99,99.9,100
 
@@ -252,6 +253,16 @@ memtier_benchmark -s $SERVER \
   -t 60 -c 20 -n 200000 \
   --distinct-client-seed --hide-histogram \
   --print-percentiles=50,99,99.9,100
+
+# Additional SET-only stress run, pipeline 1
+memtier_benchmark -s $SERVER --ratio 1:0 -t 32 -c 60 -n 200000 \
+  --distinct-client-seed --hide-histogram \
+  --print-percentiles=50,99,99.9,100
+
+# Additional SET-only stress run, pipeline 10
+memtier_benchmark -s $SERVER --ratio 1:0 -t 32 -c 60 -n 200000 \
+  --distinct-client-seed --hide-histogram \
+  --print-percentiles=50,99,99.9,100 --pipeline=10
 ```
 
 For the cache-mode SET/GET comparison, each system was started once and the four
@@ -280,6 +291,26 @@ events.
 | 1 | Dragonfly | 4,744,278 | 0.284 ms | 0.247 ms | 0.783 ms | 1.151 ms | 16.639 ms |
 | 10 | FreakV | **13,649,228** | 1.079 ms | 0.959 ms | 3.535 ms | 6.751 ms | 104.959 ms |
 | 10 | Dragonfly | 10,102,369 | 1.360 ms | 1.319 ms | 2.239 ms | 3.023 ms | 231.423 ms |
+
+### Results — Additional SET-only Stress Run (`-t 32 -c 60`)
+
+This run keeps the same server-side configuration as above, but changes the
+client load generator shape to 32 memtier threads and 60 connections per
+thread.
+
+| Pipeline | System | Ops/sec | Avg Latency | p50 | p99 | p99.9 | p100 (Max) | KB/sec |
+|----------|--------|--------:|------------:|----:|----:|------:|----------:|-------:|
+| 1 | FreakV | **6,081,261** | 0.390 ms | 0.375 ms | 0.863 ms | 2.191 ms | 208.895 ms | 468,500 |
+| 1 | Dragonfly | 5,338,687 | 0.428 ms | 0.375 ms | 1.199 ms | 1.991 ms | 231.423 ms | 411,292 |
+| 10 | FreakV | **13,682,530** | 1.637 ms | 1.551 ms | 3.679 ms | 8.095 ms | 45.567 ms | 1,054,102 |
+| 10 | Dragonfly | 9,430,224 | 2.261 ms | 2.175 ms | 3.663 ms | 6.527 ms | 51.455 ms | 726,504 |
+
+Under this client shape, FreakV is ahead on SET throughput in both cases:
+~14% higher at pipeline 1 and ~45% higher at pipeline 10. Average latency is
+also lower for FreakV in both runs, while Dragonfly has the lower p99.9 tail in
+these two measurements.
+
+### Results — Cache Mode GET (No Persistence)
 
 **GET**
 
@@ -323,6 +354,10 @@ At 32 threads on identical hardware, FreakV delivers **35% higher SET
 throughput** and **26% higher GET throughput** than Dragonfly under pipeline 10.
 At pipeline 1 (no batching), both systems perform comparably at ~4.8–4.9M
 ops/sec, with Dragonfly showing slightly tighter tail latency at p99 and p99.9.
+In the additional SET-only stress run using `-t 32 -c 60`, FreakV reaches
+**6.1M SET ops/sec** at pipeline 1 and **13.7M SET ops/sec** at pipeline 10,
+ahead of Dragonfly's **5.3M** and **9.4M** respectively under the same client
+shape.
 
 Even with snapshots enabled every 10 seconds, FreakV maintains **10.7M SET
 ops/sec** — still higher than Dragonfly's cache-mode peak of 10.1M.
