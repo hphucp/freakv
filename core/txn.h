@@ -79,26 +79,6 @@ struct mset_stat {
     _Atomic uint32_t fin_ack; /* keys committed (FIN done) — per key     */
     _Atomic uint32_t refcount; /* safety counter for distributed cleanup  */
     uint32_t total;           /* total keys in this MSET                 */
-#if FREAKV_PROFILE
-    uint64_t start_cycles;    /* end-to-end latency measurement          */
-#endif
-#if FREAKV_MSET_DEBUG
-    uint64_t start_ms;        /* wall-clock start for debug stuck logs   */
-    uint64_t last_debug_ms;   /* throttles per-stat debug output         */
-    _Atomic uint64_t dbg_ack_last_ms;
-    _Atomic uint64_t dbg_on_ack_ms;
-    _Atomic uint64_t dbg_broadcast_fin_ms;
-    _Atomic uint64_t dbg_run_fin_ms;
-    _Atomic uint64_t dbg_send_fin_remote_ms;
-    _Atomic uint64_t dbg_on_fin_ms;
-    _Atomic uint64_t dbg_send_fin_ack_ms;
-    _Atomic uint64_t dbg_on_fin_ack_ms;
-    _Atomic uint64_t dbg_bfs_enqueue_ms;
-    _Atomic uint64_t dbg_bfs_pop_ms;
-    _Atomic uint64_t dbg_bfs_done_ms;
-    _Atomic uint32_t dbg_bfs_processed;
-    _Atomic uint32_t dbg_bfs_cascade;
-#endif
     struct txn_id txn;        /* transaction identity                    */
     void *conn_ptr;           /* coordinator's net_conn for reply        */
     uint64_t conn_generation; /* stale connection detection              */
@@ -137,9 +117,6 @@ struct cmd_info {
 
     /* ── Regular command fields (is_mset == false) ─────────────────── */
     struct spsc_message msg;      /* original message for deferred exec    */
-#if FREAKV_MIXED_PROFILE
-    uint64_t defer_cycles;        /* when regular command entered waitqueue */
-#endif
 
     /* ── Common ────────────────────────────────────────────────────── */
     uint64_t hash56;              /* precomputed key hash for fast lookup  */

@@ -95,12 +95,6 @@ struct net_pipeline_slot {
   uint8_t shard_owner;    /* owner shard id (for single) */
   struct net_buf *req_nb; /* input buffer refcount */
   struct resp_cmd cmd;    /* parsed command */
-
-#if FREAKV_MSET_DEBUG
-  void *debug_mset_stat;       /* debug-only: stat after kv_obj_ptr detach */
-  uint64_t debug_mset_start_ms; /* debug-only: stat start wall clock        */
-  uint64_t debug_mset_reply_ready_ms; /* debug-only: +OK ready timestamp    */
-#endif
 };
 
 /* ── struct net_proxy_pipeline (circular queue) ─────────────────────── */
@@ -130,13 +124,6 @@ struct net_conn {
   size_t wbuf_cap;
   size_t wbuf_len;
   size_t wbuf_sent;
-#if FREAKV_MSET_DEBUG
-  uint32_t debug_mset_wbuf_replies; /* debug-only: MSET replies in wbuf     */
-  uint64_t debug_mset_wbuf_max_age; /* debug-only: max age in current wbuf  */
-  uint64_t debug_mset_wbuf_max_ready_age; /* reply_ready -> socket write     */
-  uint64_t debug_mset_last_transport_log_ms; /* throttles transport debug      */
-  uint64_t debug_mset_dirty_mark_ms; /* last time conn entered dirty list   */
-#endif
 
   /* RESP parser */
   struct resp_parser resp;

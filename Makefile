@@ -5,18 +5,12 @@
 #   make clean            — remove build artefacts
 
 CC      := gcc
-PROFILE ?= 0
-MSET_DEBUG ?= 0
-MIXED_PROFILE ?= 0
 
 CFLAGS  := -std=c11 -O1 -g -Wall -Wextra -Wpedantic \
             -Wno-unused-parameter \
             -Wno-unused-variable \
             -Wno-unused-function \
             -D_GNU_SOURCE \
-            -DFREAKV_PROFILE=$(PROFILE) \
-            -DFREAKV_MSET_DEBUG=$(MSET_DEBUG) \
-            -DFREAKV_MIXED_PROFILE=$(MIXED_PROFILE) \
             -march=native \
             -fwrapv \
             -I. -Icore -Ihashtable -Imem -Inet -Iprotocol

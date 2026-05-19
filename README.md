@@ -69,13 +69,6 @@ Useful build flags:
 make clean
 make ASAN=1
 
-# Enable profiling counters/logging paths compiled behind FREAKV_PROFILE
-make clean
-make PROFILE=1
-
-# Enable MSET debug instrumentation
-make clean
-make MSET_DEBUG=1
 ```
 
 ### Run

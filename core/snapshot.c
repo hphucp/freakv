@@ -305,19 +305,12 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
   snap_delta_filename(ss->filepath, sizeof(ss->filepath), ss->snap_dir,
                       shard->id, ss->current_epoch);
 
-  uint64_t t_start = PROF_NOW();
-  uint64_t t_open = PROF_NOW();
   snap_writer_t w;
   if (!snap_writer_open(&w, ss->filepath)) {
     fprintf(stderr, "[shard %u] snapshot: cannot open %s: %s\n", shard->id,
             ss->filepath, strerror(errno));
     return false;
   }
-  PROF_RECORD(shard->prof.snap_open, t_open);
-
-  uint64_t t_scan = PROF_NOW();
-  uint64_t c_write = 0;
-
   const size_t hdr_offset = 0;
   {
     struct snap_file_header hdr_init = {
@@ -329,9 +322,7 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
         .epoch = ss->current_epoch,
         .timestamp_ms = snap_time_ms(),
     };
-    uint64_t _tw = PROF_NOW();
     bool _ok = snap_writer_put(&w, &hdr_init, sizeof(hdr_init));
-    c_write += PROF_NOW() - _tw;
     if (!_ok)
       goto fail;
   }
@@ -403,10 +394,8 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
         continue;
       }
 
-      uint64_t _tw = PROF_NOW();
       struct snap_page_record *pr =
           (struct snap_page_record *)snap_writer_reserve(&w, sizeof(*pr));
-      c_write += PROF_NOW() - _tw;
       if (!pr)
         goto fail;
       *pr = (struct snap_page_record){
@@ -425,13 +414,11 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
         if (!modified_bit_test(heap->snap_slot_bits, lpage, s))
           continue;
 
-        uint64_t t_cache_start = PROF_NOW();
         struct kv_obj *o =
             (struct kv_obj *)(page_base + first_off + (size_t)s * obj_size);
 
         uint8_t current_flag =
             atomic_load_explicit(&o->snap_flag, memory_order_acquire);
-        PROF_RECORD(shard->prof.snap_cache, t_cache_start);
 
         bool is_deleted = false;
         bool snap_should_unref = false;
@@ -465,17 +452,13 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
           ent.val_len = o->val_len;
         }
 
-        uint64_t _tw1 = PROF_NOW();
         bool _ok1 = snap_writer_put(&w, &ent, sizeof(ent));
-        c_write += PROF_NOW() - _tw1;
         if (!_ok1)
           goto fail;
 
         if (!is_deleted) {
           size_t kv_len = (size_t)o->key_len + (size_t)o->val_len;
-          uint64_t _tw2 = PROF_NOW();
           bool _ok2 = snap_writer_put(&w, o->data, kv_len);
-          c_write += PROF_NOW() - _tw2;
           if (!_ok2)
             goto fail;
         }
@@ -510,41 +493,19 @@ static bool snap_serialize_epoch(struct snap_state *ss, struct shard *shard) {
       page_records;
 
   struct snap_file_footer footer = {.checksum = 0};
-  uint64_t _twf = PROF_NOW();
   bool _okf = snap_writer_put(&w, &footer, sizeof(footer));
-  c_write += PROF_NOW() - _twf;
   if (!_okf)
     goto fail;
 
-  uint64_t total_scan_cycles = (PROF_NOW() - t_scan) - c_write;
-#if FREAKV_PROFILE
-  shard->prof.snap_scan.total_cycles += total_scan_cycles;
-  shard->prof.snap_scan.count++;
-  if (total_scan_cycles > shard->prof.snap_scan.max_cycles)
-    shard->prof.snap_scan.max_cycles = total_scan_cycles;
-
-  shard->prof.snap_write.total_cycles += c_write;
-  shard->prof.snap_write.count++;
-  if (c_write > shard->prof.snap_write.max_cycles)
-    shard->prof.snap_write.max_cycles = c_write;
-#else
-  (void)total_scan_cycles;
-  (void)c_write;
-#endif
-
-  uint64_t t_close = PROF_NOW();
   if (!snap_writer_close(&w)) {
     fprintf(stderr, "[shard %u] snapshot closure failed: %s\n", shard->id,
             strerror(errno));
     return false;
   }
-  PROF_RECORD(shard->prof.snap_close, t_close);
-
   printf("[shard %u] snapshot epoch=%" PRIu64 ": %u pages, %u slots -> %s\n",
          shard->id, ss->current_epoch, page_records, total_slots, ss->filepath);
   fflush(stdout);
 
-  PROF_RECORD(shard->prof.snap_duration, t_start);
   return true;
 
 fail:
@@ -845,12 +806,10 @@ void snap_engine_tick(struct snap_state *ss, struct shard *shard) {
   }
 
   struct thread_heap *heap = shard->mem;
-  uint64_t t_merge = PROF_NOW();
   for (uint32_t i = 0; i < NR_SMALL_POOLS; i++) {
     pool_snap_merge(&heap->pools[i], heap->pages);
   }
   pool_snap_merge(&heap->span_meta_pool, heap->pages);
-  PROF_RECORD(shard->prof.merge_snap, t_merge);
 
   struct kv_obj *objs = heap->snap_large_freelist;
   heap->snap_large_freelist = NULL;

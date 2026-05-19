@@ -46,125 +46,8 @@ static inline uint64_t net_time_ms_get(void) {
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-static bool net_mset_debug_enabled(void) {
-#if !FREAKV_MSET_DEBUG
-  return false;
-#else
-  static int cached = -1;
-  if (cached < 0) {
-    const char *v = getenv("MSET_DEBUG_STUCK");
-    cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
-  }
-  return cached != 0;
-#endif
-}
-
-static uint64_t net_mset_debug_slow_ms(void) {
-  static uint64_t cached = 0;
-  if (!cached) {
-    const char *v = getenv("MSET_DEBUG_SLOW_MS");
-    cached = v && v[0] ? strtoull(v, NULL, 10) : 100;
-    if (!cached)
-      cached = 100;
-  }
-  return cached;
-}
-
-static bool net_mset_transport_debug_enabled(void) {
-#if !FREAKV_MSET_DEBUG
-  return false;
-#else
-  static int cached = -1;
-  if (cached < 0) {
-    const char *v = getenv("MSET_DEBUG_TRANSPORT");
-    cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
-  }
-  return cached != 0;
-#endif
-}
-
-static uint64_t net_mset_transport_interval_ms(void) {
-  static uint64_t cached = 0;
-  if (!cached) {
-    const char *v = getenv("MSET_DEBUG_TRANSPORT_INTERVAL_MS");
-    cached = v && v[0] ? strtoull(v, NULL, 10) : 250;
-    if (!cached)
-      cached = 250;
-  }
-  return cached;
-}
-
 static inline void net_reactor_mark_dirty(struct reactor *r,
                                           struct net_conn *c);
-
-static void net_mset_dirty_summary(struct net_conn *c, uint64_t cur_ms,
-                                   uint32_t *ready, uint32_t *pending,
-                                   uint32_t *first_seq,
-                                   uint64_t *max_ready_age) {
-  *ready = 0;
-  *pending = 0;
-  *first_seq = 0;
-  *max_ready_age = 0;
-#if FREAKV_MSET_DEBUG
-  if (!c || !c->proxy.slots)
-    return;
-
-  for (uint32_t seq = c->proxy.out; seq != c->proxy.in; seq++) {
-    struct net_pipeline_slot *s = &c->proxy.slots[seq & (c->proxy.cap - 1)];
-    if (s->parent_cmd_id != MSG_CMD_MSET_PART)
-      continue;
-    if (!*ready && !*pending)
-      *first_seq = seq;
-    if (s->state == PSLOT_LOCAL || s->state == PSLOT_DONE) {
-      (*ready)++;
-      uint64_t ready_ms = s->debug_mset_reply_ready_ms;
-      uint64_t age = ready_ms && cur_ms >= ready_ms ? cur_ms - ready_ms : 0;
-      if (age > *max_ready_age)
-        *max_ready_age = age;
-    } else {
-      (*pending)++;
-    }
-  }
-#else
-  (void)c;
-  (void)cur_ms;
-#endif
-}
-
-static void net_mset_log_dirty_event(struct reactor *r, struct net_conn *c,
-                                     const char *event, const char *reason,
-                                     uint64_t cur_ms) {
-#if FREAKV_MSET_DEBUG
-  if (!net_mset_debug_enabled() || !net_mset_transport_debug_enabled() || !c)
-    return;
-
-  uint32_t ready = 0, pending = 0, first_seq = 0;
-  uint64_t max_ready_age = 0;
-  net_mset_dirty_summary(c, cur_ms, &ready, &pending, &first_seq,
-                         &max_ready_age);
-  if (!ready && !pending && !c->debug_mset_wbuf_replies && c->wbuf_len == 0)
-    return;
-
-  fprintf(stderr,
-          "[MSET_DIRTY] ts_ms=%lu event=%s reason=%s shard=%u conn=%p fd=%d "
-          "list_type=%u ready_mset=%u pending_mset=%u first_seq=%u "
-          "max_ready_age_ms=%lu wbuf_len=%zu wbuf_sent=%zu pipe_out=%u "
-          "pipe_in=%u dirty_age_ms=%lu\n",
-          (unsigned long)cur_ms, event, reason ? reason : "-",
-          r->shard->id, (void *)c, c->fd, c->list_type, ready, pending,
-          first_seq, (unsigned long)max_ready_age, c->wbuf_len, c->wbuf_sent,
-          c->proxy.out, c->proxy.in,
-          c->debug_mset_dirty_mark_ms && cur_ms >= c->debug_mset_dirty_mark_ms
-              ? (unsigned long)(cur_ms - c->debug_mset_dirty_mark_ms)
-              : 0UL);
-#else
-  (void)r;
-  (void)c;
-  (void)event;
-  (void)reason;
-  (void)cur_ms;
-#endif
-}
 
 /* ── struct net_conn lifecycle ───────────────────────────────────────── */
 
@@ -241,9 +124,8 @@ static inline void net_reactor_list_remove(struct reactor *r,
 static inline void net_reactor_mark_dirty_reason(struct reactor *r,
                                                  struct net_conn *c,
                                                  const char *reason) {
-  uint64_t cur_ms = net_time_ms_get();
+  (void)reason;
   if (c->list_type == 1) {
-    net_mset_log_dirty_event(r, c, "mark_already_dirty", reason, cur_ms);
     return;
   }
   net_reactor_list_remove(r, c);
@@ -252,10 +134,6 @@ static inline void net_reactor_mark_dirty_reason(struct reactor *r,
     r->dirty_head->prev = c;
   r->dirty_head = c;
   c->list_type = 1;
-#if FREAKV_MSET_DEBUG
-  c->debug_mset_dirty_mark_ms = cur_ms;
-#endif
-  net_mset_log_dirty_event(r, c, "mark", reason, cur_ms);
 }
 
 static inline void net_reactor_mark_dirty(struct reactor *r,
@@ -635,23 +513,6 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
         write(c->fd, c->wbuf + c->wbuf_sent, c->wbuf_len - c->wbuf_sent);
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-#if FREAKV_MSET_DEBUG
-        if (net_mset_debug_enabled() && c->debug_mset_wbuf_replies > 0) {
-          uint64_t cur_ms = net_time_ms_get();
-          if (net_mset_transport_debug_enabled() ||
-              c->debug_mset_wbuf_max_age >= net_mset_debug_slow_ms()) {
-            fprintf(stderr,
-                    "[MSET_SOCKET_EAGAIN] ts_ms=%lu shard=%u conn=%p fd=%d "
-                    "mset_replies=%u max_age_ms=%lu max_ready_age_ms=%lu "
-                    "wbuf_sent=%zu wbuf_len=%zu pipe_out=%u pipe_in=%u\n",
-                    (unsigned long)cur_ms, r->shard->id, (void *)c, c->fd,
-                    c->debug_mset_wbuf_replies,
-                    (unsigned long)c->debug_mset_wbuf_max_age,
-                    (unsigned long)c->debug_mset_wbuf_max_ready_age,
-                    c->wbuf_sent, c->wbuf_len, c->proxy.out, c->proxy.in);
-          }
-        }
-#endif
         /* Socket buffer full: must wait for Master Flush or next EPOLLOUT */
         net_reactor_mark_dirty_reason(r, c, "socket_eagain");
         return;
@@ -660,56 +521,7 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
       net_reactor_mark_dead(r, c);
       return;
     }
-    size_t before_sent = c->wbuf_sent;
-    size_t before_remaining = c->wbuf_len - c->wbuf_sent;
     c->wbuf_sent += (size_t)n;
-#if FREAKV_MSET_DEBUG
-    if (net_mset_debug_enabled() && c->debug_mset_wbuf_replies > 0 &&
-        c->wbuf_sent >= c->wbuf_len) {
-      uint64_t cur_ms = net_time_ms_get();
-      bool due = net_mset_transport_debug_enabled() &&
-                 cur_ms - c->debug_mset_last_transport_log_ms >=
-                     net_mset_transport_interval_ms();
-      if (due || c->debug_mset_wbuf_max_age >= net_mset_debug_slow_ms() ||
-          c->debug_mset_wbuf_max_ready_age >= net_mset_debug_slow_ms()) {
-        fprintf(stderr,
-                "[MSET_SOCKET_WRITE] ts_ms=%lu shard=%u conn=%p fd=%d "
-                "mset_replies=%u max_age_ms=%lu max_ready_age_ms=%lu "
-                "write_n=%zd before_sent=%zu before_remaining=%zu "
-                "bytes_sent=%zu wbuf_len=%zu partial=%d pipe_out=%u "
-                "pipe_in=%u\n",
-                (unsigned long)cur_ms, r->shard->id, (void *)c, c->fd,
-                c->debug_mset_wbuf_replies,
-                (unsigned long)c->debug_mset_wbuf_max_age,
-                (unsigned long)c->debug_mset_wbuf_max_ready_age, n,
-                before_sent, before_remaining, c->wbuf_sent, c->wbuf_len,
-                (size_t)n < before_remaining, c->proxy.out, c->proxy.in);
-        c->debug_mset_last_transport_log_ms = cur_ms;
-      }
-      c->debug_mset_wbuf_replies = 0;
-      c->debug_mset_wbuf_max_age = 0;
-      c->debug_mset_wbuf_max_ready_age = 0;
-    } else if (net_mset_debug_enabled() && net_mset_transport_debug_enabled() &&
-               c->debug_mset_wbuf_replies > 0 &&
-               (size_t)n < before_remaining) {
-      uint64_t cur_ms = net_time_ms_get();
-      if (cur_ms - c->debug_mset_last_transport_log_ms >=
-          net_mset_transport_interval_ms()) {
-        fprintf(stderr,
-                "[MSET_SOCKET_PARTIAL] ts_ms=%lu shard=%u conn=%p fd=%d "
-                "mset_replies=%u max_age_ms=%lu max_ready_age_ms=%lu "
-                "write_n=%zd before_sent=%zu before_remaining=%zu "
-                "wbuf_sent=%zu wbuf_len=%zu pipe_out=%u pipe_in=%u\n",
-                (unsigned long)cur_ms, r->shard->id, (void *)c, c->fd,
-                c->debug_mset_wbuf_replies,
-                (unsigned long)c->debug_mset_wbuf_max_age,
-                (unsigned long)c->debug_mset_wbuf_max_ready_age, n,
-                before_sent, before_remaining, c->wbuf_sent, c->wbuf_len,
-                c->proxy.out, c->proxy.in);
-        c->debug_mset_last_transport_log_ms = cur_ms;
-      }
-    }
-#endif
   }
 }
 
@@ -721,12 +533,6 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
    * net_slot_write_to_wbuf writes to c->wbuf (heap), not to the fd —
    * safe here; the wbuf is discarded when net_conn_free runs. */
   struct net_proxy_pipeline *pp = &c->proxy;
-  uint32_t flushed_mset = 0;
-  uint32_t first_mset_seq = 0;
-  uint32_t last_mset_seq = 0;
-  uint64_t max_mset_age = 0;
-  uint64_t max_mset_ready_age = 0;
-  uint64_t cur_ms = 0;
 
   while (pp->out != pp->in) {
     struct net_pipeline_slot *s = &pp->slots[pp->out & (pp->cap - 1)];
@@ -734,58 +540,8 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
     /* Stop at first incomplete slot (head-of-line, but per-slot not per-batch)
      */
     if (s->state != PSLOT_LOCAL && s->state != PSLOT_DONE) {
-#if FREAKV_MSET_DEBUG
-      if (net_mset_debug_enabled() &&
-          s->parent_cmd_id == MSG_CMD_MSET_PART &&
-          (s->kv_obj_ptr || s->debug_mset_stat)) {
-        struct mset_stat *stat = s->kv_obj_ptr
-                                     ? (struct mset_stat *)s->kv_obj_ptr
-                                     : (struct mset_stat *)s->debug_mset_stat;
-        uint64_t cur_ms = net_time_ms_get();
-        uint64_t start_ms = stat->start_ms ? stat->start_ms
-                                           : s->debug_mset_start_ms;
-        uint64_t age_ms =
-            start_ms && cur_ms >= start_ms ? cur_ms - start_ms : 0;
-        uint64_t threshold = net_mset_debug_slow_ms();
-        if (age_ms >= threshold &&
-            cur_ms - stat->last_debug_ms >= threshold) {
-          stat->last_debug_ms = cur_ms;
-          fprintf(stderr,
-                  "[MSET_PIPELINE_HOL] ts_ms=%lu shard=%u conn=%p fd=%d out=%u in=%u "
-                  "state=%u stat=%p age_ms=%lu pidx=%u total=%u ack=%u "
-                  "fin_ack=%u inflight=%u wbuf_len=%zu\n",
-                  (unsigned long)cur_ms, r->shard->id, (void *)c, c->fd,
-                  pp->out, pp->in,
-                  (uint32_t)s->state, (void *)stat, (unsigned long)age_ms,
-                  stat->pipeline_idx, stat->total,
-                  atomic_load_explicit(&stat->ack, memory_order_acquire),
-                  atomic_load_explicit(&stat->fin_ack, memory_order_acquire),
-                  r->shard->mset_inflight, c->wbuf_len);
-        }
-      }
-#endif
       break;
     }
-
-#if FREAKV_MSET_DEBUG
-    if (net_mset_debug_enabled() && s->parent_cmd_id == MSG_CMD_MSET_PART) {
-      if (!cur_ms)
-        cur_ms = net_time_ms_get();
-      uint64_t start_ms = s->debug_mset_start_ms;
-      uint64_t age_ms = start_ms && cur_ms >= start_ms ? cur_ms - start_ms : 0;
-      uint64_t ready_ms = s->debug_mset_reply_ready_ms;
-      uint64_t ready_age_ms =
-          ready_ms && cur_ms >= ready_ms ? cur_ms - ready_ms : 0;
-      if (!flushed_mset)
-        first_mset_seq = pp->out;
-      last_mset_seq = pp->out;
-      flushed_mset++;
-      if (age_ms > max_mset_age)
-        max_mset_age = age_ms;
-      if (ready_age_ms > max_mset_ready_age)
-        max_mset_ready_age = ready_age_ms;
-    }
-#endif
 
     /* Serialize reply into wbuf */
     net_slot_write_to_wbuf(r, c, s);
@@ -795,34 +551,6 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c) {
     pp->out++;
   }
 
-#if FREAKV_MSET_DEBUG
-  if (net_mset_debug_enabled() && flushed_mset > 0) {
-    c->debug_mset_wbuf_replies += flushed_mset;
-    if (max_mset_age > c->debug_mset_wbuf_max_age)
-      c->debug_mset_wbuf_max_age = max_mset_age;
-    if (max_mset_ready_age > c->debug_mset_wbuf_max_ready_age)
-      c->debug_mset_wbuf_max_ready_age = max_mset_ready_age;
-    bool due = net_mset_transport_debug_enabled() &&
-               (cur_ms ? cur_ms : net_time_ms_get()) -
-                       c->debug_mset_last_transport_log_ms >=
-                   net_mset_transport_interval_ms();
-    if (due || max_mset_age >= net_mset_debug_slow_ms() ||
-        max_mset_ready_age >= net_mset_debug_slow_ms()) {
-      uint64_t log_ms = cur_ms ? cur_ms : net_time_ms_get();
-      fprintf(stderr,
-              "[MSET_PIPE_FLUSH] ts_ms=%lu shard=%u conn=%p fd=%d "
-              "flushed_mset=%u first_seq=%u last_seq=%u max_age_ms=%lu "
-              "max_ready_age_ms=%lu pipe_out=%u pipe_in=%u wbuf_len=%zu "
-              "wbuf_sent=%zu\n",
-              (unsigned long)log_ms,
-              r->shard->id, (void *)c, c->fd, flushed_mset, first_mset_seq,
-              last_mset_seq, (unsigned long)max_mset_age,
-              (unsigned long)max_mset_ready_age, pp->out, pp->in,
-              c->wbuf_len, c->wbuf_sent);
-      c->debug_mset_last_transport_log_ms = log_ms;
-    }
-  }
-#endif
 }
 
 // Move resp_handler.h to top
@@ -1149,8 +877,6 @@ void net_reactor_run(struct reactor *r) {
     /* 3. Master Flush — dynamically drain all dirty connections */
     while (r->dirty_head) {
       struct net_conn *curr = r->dirty_head;
-      uint64_t dirty_pop_ms = net_time_ms_get();
-      net_mset_log_dirty_event(r, curr, "pop", "master_flush", dirty_pop_ms);
       net_reactor_list_remove(r, curr);
 
       if (curr->fd >= 0 && curr->pending_reason == CONN_PENDING_NONE &&

@@ -465,27 +465,6 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
   return true;
 }
 
-static bool resp_mixed_profile_enabled(void) {
-  static int cached = -1;
-  if (cached < 0) {
-    const char *v = getenv("MSET_MIXED_PROFILE");
-    cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
-  }
-  return cached != 0;
-}
-
-static uint64_t resp_mixed_profile_slow_cycles(void) {
-  static uint64_t cached = 0;
-  if (!cached) {
-    const char *v = getenv("MSET_MIXED_SLOW_US");
-    uint64_t us = v && v[0] ? strtoull(v, NULL, 10) : 1000;
-    if (!us)
-      us = 1000;
-    cached = us * 3000ULL;
-  }
-  return cached;
-}
-
 static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
                                 uint16_t cmd_op, uint32_t pipeline_seq,
                                 struct resp_parser *p,
@@ -528,20 +507,7 @@ static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
               .pipeline_idx = pipeline_seq,
           },
   };
-  bool prof = resp_mixed_profile_enabled();
-  uint64_t t_exec = prof ? cycles_now() : 0;
   enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
-  if (prof) {
-    uint64_t dur = cycles_now() - t_exec;
-    if (dur >= resp_mixed_profile_slow_cycles() ||
-        exec_rc == PROXY_EXEC_DEFERRED) {
-      fprintf(stderr,
-              "[MSET_MIXED_LOCAL] shard=%u cmd=%u pidx=%u durcy=%lu "
-              "deferred=%d\n",
-              r->shard->id, cmd_op, pipeline_seq, (unsigned long)dur,
-              exec_rc == PROXY_EXEC_DEFERRED);
-    }
-  }
   if (exec_rc == PROXY_EXEC_DEFERRED)
     return 1;
 
@@ -879,9 +845,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                 .pipeline_idx = pipeline_seq,
                 .sub_idx = i,
             }};
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-        msg.sent_cycles = PROF_NOW();
-#endif
         enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, now);
         if (exec_rc == PROXY_EXEC_DONE) {
           s->multi_replies[i] = (uint8_t *)msg.u.reply.reply_buf;

@@ -18,7 +18,6 @@
 #include "lock_manager.h"
 #include "message.h"
 #include "object.h"
-#include "profile.h"
 #include "snapshot.h"
 #include "spsc.h"
 #include "ttl_index.h"
@@ -74,18 +73,8 @@ struct shard {
   uint64_t ops_completed;
   uint64_t cross_shard_sent;
   uint64_t cross_shard_received;
-#if FREAKV_MSET_DEBUG
-  uint64_t mset_debug_last_ms;
-  uint64_t mset_debug_progress_last_ms;
-  uint64_t mset_debug_last_dispatch;
-  uint64_t mset_debug_last_e2e;
-  bool mset_debug_all_complete_logged;
-#endif
 
   struct snap_state snap;
-#if FREAKV_PROFILE
-  struct shard_prof prof;
-#endif
 };
 
 struct shard_engine {

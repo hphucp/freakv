@@ -4,8 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "profile.h"
-
 struct resp_cmd {
   uint32_t argc;
   char **argv;    /* dynamically allocated */
@@ -175,9 +173,6 @@ struct spsc_message {
       struct mset_stat *stat;
     } mset_stat;
   } u;
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-  uint64_t sent_cycles; /* Timestamp when message was pushed to queue */
-#endif
 };
 
 #endif /* MESSAGE_H */
