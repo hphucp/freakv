@@ -127,4 +127,12 @@ static inline bool spsc_queue_empty(struct spsc_queue *q) {
          atomic_load_explicit(&q->head, memory_order_acquire);
 }
 
+static inline bool spsc_queue_try_disarm_wake(struct spsc_queue *q) {
+  atomic_store_explicit(&q->wake_edge, 0, memory_order_seq_cst);
+  if (spsc_queue_empty(q))
+    return true;
+  atomic_store_explicit(&q->wake_edge, 1, memory_order_seq_cst);
+  return false;
+}
+
 #endif /* SPSC_H */

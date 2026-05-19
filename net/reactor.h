@@ -18,7 +18,7 @@ struct reactor {
   int shared_listen_fd; /* shared port: base_port (SO_REUSEPORT) */
   int wake_fd;
   int timer_fd;
-  uint32_t proxy_wake_mask;
+  uint64_t proxy_wake_mask;
   uint16_t port;      /* per-shard port                        */
   uint16_t base_port; /* shared single-port entry point        */
   char bind_ip[64];

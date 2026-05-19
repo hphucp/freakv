@@ -118,6 +118,15 @@ void shard_obj_destroy(struct shard *s, struct kv_obj *o);
 void shard_obj_ref(struct kv_obj *o);
 void shard_obj_unref(struct shard *s, struct kv_obj *o);
 
+void shard_send_msg_wake(struct shard_engine *engine, uint32_t from,
+                         uint32_t to, struct spsc_message *msg);
+
+void shard_send_msg_deferred(struct shard_engine *engine, uint32_t from,
+                             uint32_t to, struct spsc_message *msg,
+                             uint64_t *wake_mask);
+
+void shard_flush_wakeup(struct shard_engine *engine, uint64_t *wake_mask);
+
 /* LRU helpers (used by mset_exec.c) */
 void lru_node_remove(struct shard *s, struct kv_obj *o);
 void lru_node_prepend(struct shard *s, struct kv_obj *o);

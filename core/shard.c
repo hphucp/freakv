@@ -43,6 +43,48 @@ static uint64_t mixed_profile_slow_cycles(void) {
   return cached;
 }
 
+static inline void shard_wakeup_one(struct shard_engine *engine, uint32_t to) {
+  if (engine->wake_fds && engine->wake_fds[to] >= 0) {
+    uint64_t one = 1;
+    (void)write(engine->wake_fds[to], &one, sizeof(one));
+  }
+}
+
+void shard_send_msg_wake(struct shard_engine *engine, uint32_t from,
+                         uint32_t to, struct spsc_message *msg) {
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+  msg->sent_cycles = PROF_NOW();
+#endif
+  struct spsc_queue *q = &engine->queues[from * engine->num_shards + to];
+  while (!spsc_queue_push(q, msg))
+    sched_yield();
+
+  if (atomic_exchange_explicit(&q->wake_edge, 1, memory_order_seq_cst) == 0)
+    shard_wakeup_one(engine, to);
+}
+
+void shard_send_msg_deferred(struct shard_engine *engine, uint32_t from,
+                             uint32_t to, struct spsc_message *msg,
+                             uint64_t *wake_mask) {
+#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
+  msg->sent_cycles = PROF_NOW();
+#endif
+  struct spsc_queue *q = &engine->queues[from * engine->num_shards + to];
+  while (!spsc_queue_push(q, msg))
+    sched_yield();
+  *wake_mask |= (1ULL << to);
+}
+
+void shard_flush_wakeup(struct shard_engine *engine, uint64_t *wake_mask) {
+  uint64_t mask = *wake_mask;
+  *wake_mask = 0;
+  while (mask) {
+    uint32_t to = (uint32_t)__builtin_ctzll(mask);
+    mask &= mask - 1;
+    shard_wakeup_one(engine, to);
+  }
+}
+
 static const char *mixed_cmd_name(uint16_t cmd) {
   switch (cmd) {
   case MSG_CMD_SET:
@@ -732,17 +774,7 @@ finish:
 static void shard_send_reply(struct shard_engine *engine, struct shard *shard,
                              const struct spsc_message *msg,
                              struct spsc_message *reply) {
-  struct spsc_queue *rq =
-      &engine->queues[shard->id * engine->num_shards + msg->shard_owner];
-  while (!spsc_queue_push(rq, reply))
-    sched_yield();
-  /* Wake the sender */
-  if (engine->wake_fds && engine->wake_fds[msg->shard_owner] >= 0) {
-    uint64_t one = 1;
-    if (write(engine->wake_fds[msg->shard_owner], &one, sizeof(one)) <
-        0) { /* ignore */
-    }
-  }
+  shard_send_msg_wake(engine, shard->id, msg->shard_owner, reply);
 }
 
 /* ── (Old shard_mset_participant_wait removed — replaced by async 2PC) ── */
@@ -771,7 +803,7 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
       continue;
 
     struct spsc_message msg;
-    uint32_t wake_mask = 0;
+    uint64_t wake_mask = 0;
     uint32_t sender_run = 0;
     while (true) {
       while (spsc_queue_pop(q, &msg)) {
@@ -912,42 +944,23 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
 
           shard->ops_completed++;
 
-          struct spsc_queue *rq =
-              &engine->queues[shard->id * engine->num_shards + msg.shard_owner];
           struct spsc_message reply = {
               .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
               .shard_owner = (uint8_t)shard->id,
               .u.reply = msg.u.reply,
           };
-          while (true) {
-            if (spsc_queue_push(rq, &reply)) {
-              wake_mask |= (1U << msg.shard_owner);
-              break;
-            }
-            sched_yield();
-          }
+          shard_send_msg_deferred(engine, shard->id, msg.shard_owner, &reply,
+                                  &wake_mask);
         }
       }
 
-      atomic_store_explicit(&q->wake_edge, 0, memory_order_seq_cst);
-      if (spsc_queue_empty(q))
+      if (spsc_queue_try_disarm_wake(q))
         break;
-      atomic_store_explicit(&q->wake_edge, 1, memory_order_seq_cst);
     }
     if (drain_prof && sender_run > max_sender_run)
       max_sender_run = sender_run;
 
-    if (wake_mask && engine->wake_fds) {
-      uint32_t p = 0;
-      while (wake_mask) {
-        if ((wake_mask & 1) && engine->wake_fds[p] >= 0) {
-          uint64_t one = 1;
-          (void)write(engine->wake_fds[p], &one, sizeof(one));
-        }
-        wake_mask >>= 1;
-        p++;
-      }
-    }
+    shard_flush_wakeup(engine, &wake_mask);
   }
   if (drain_prof && total_msgs > 0) {
     uint64_t total_cycles = PROF_NOW() - drain_start;

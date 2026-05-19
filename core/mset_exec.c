@@ -13,11 +13,9 @@
 #include "../net/conn.h"
 #include "../net/reactor.h"
 
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 /* ── Forward declarations ────────────────────────────────────────────── */
 
@@ -44,22 +42,6 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
 
 /* ── Low-level helpers ───────────────────────────────────────────────── */
 
-static inline void send_to_shard(struct shard_engine *engine, uint32_t from,
-                                 uint32_t to, struct spsc_message *msg) {
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-  msg->sent_cycles = PROF_NOW();
-#endif
-  struct spsc_queue *q = &engine->queues[from * engine->num_shards + to];
-  while (!spsc_queue_push(q, msg))
-    sched_yield();
-
-  if (atomic_exchange_explicit(&q->wake_edge, 1, memory_order_seq_cst) == 0) {
-    if (engine->wake_fds && engine->wake_fds[to] >= 0) {
-      uint64_t one = 1;
-      (void)write(engine->wake_fds[to], &one, sizeof(one));
-    }
-  }
-}
 
 static inline uint64_t now_ms(void) {
   struct timespec ts;
@@ -494,7 +476,7 @@ static void mset_complete_regular_reply(struct shard_engine *engine,
       .shard_owner = (uint8_t)shard->id,
       .u.reply = ci->msg.u.reply,
   };
-  send_to_shard(engine, shard->id, ci->origin_shard, &reply);
+  shard_send_msg_wake(engine, shard->id, ci->origin_shard, &reply);
   ci->req_nb = NULL; /* reply now owns the request-buffer ref */
 }
 
@@ -809,7 +791,7 @@ static struct mset_stat *try_send_ack(struct shard_engine *engine,
               .pipeline_idx = stat->pipeline_idx,
           },
   };
-  send_to_shard(engine, shard->id, stat->coordinator_id, &ack);
+  shard_send_msg_wake(engine, shard->id, stat->coordinator_id, &ack);
   return NULL;
 }
 
@@ -873,8 +855,6 @@ static void mset_send_fin_to_remotes(struct shard_engine *engine,
 
   uint32_t my_id = shard->id;
   uint32_t nshards = engine->num_shards;
-  uint32_t wake_mask = 0;
-
   for (uint32_t sid = 0; sid < nshards; sid++) {
     if (sid == my_id || !stat->shard_heads[sid])
       continue;
@@ -885,7 +865,7 @@ static void mset_send_fin_to_remotes(struct shard_engine *engine,
     };
     MSET_DBG_STORE(stat->dbg_send_fin_remote_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "send_fin_remote", now_ms(), sid);
-    send_to_shard(engine, my_id, sid, &fin);
+    shard_send_msg_wake(engine, my_id, sid, &fin);
   }
 }
 
@@ -1391,14 +1371,7 @@ static void mset_run_fin(struct shard_engine *engine, struct shard *shard,
           MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
           mset_debug_lifecycle(shard, stat, "send_fin_ack", now_ms(),
                                stat->coordinator_id);
-          send_to_shard(engine, shard->id, stat->coordinator_id, &fack);
-
-          /* Wake up coordinator shard */
-          if (engine->wake_fds && engine->wake_fds[stat->coordinator_id] >= 0) {
-            uint64_t one = 1;
-            (void)write(engine->wake_fds[stat->coordinator_id], &one,
-                        sizeof(one));
-          }
+          shard_send_msg_wake(engine, shard->id, stat->coordinator_id, &fack);
         }
       }
       /* Non-last shards: nothing to do. */
@@ -1528,7 +1501,7 @@ static bool mset_try_early_commit(struct shard_engine *engine,
     MSET_DBG_STORE(stat->dbg_send_fin_ack_ms, now_ms());
     mset_debug_lifecycle(shard, stat, "early_send_fin_ack", now_ms(),
                          stat->coordinator_id);
-    send_to_shard(engine, shard->id, stat->coordinator_id, &fack);
+    shard_send_msg_wake(engine, shard->id, stat->coordinator_id, &fack);
   }
   return true;
 }
@@ -2173,7 +2146,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
   }
 #endif
 
-  uint32_t wake_mask = 0;
+  uint64_t wake_mask = 0;
 
   /* Stack arrays: O(1) access by shard_id during dispatch, no heap alloc. */
   uint32_t counts[MAX_SHARDS];
@@ -2254,22 +2227,14 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
                 .stat = stat,
             },
     };
-    struct spsc_queue *q = &engine->queues[my_id * nshards + sid];
     uint64_t t2 = PROF_NOW();
-    while (!spsc_queue_push(q, &bmsg))
-      __builtin_ia32_pause();
+    shard_send_msg_deferred(engine, my_id, sid, &bmsg, &wake_mask);
     PROF_RECORD(r->shard->prof.coord_queue_wait, t2);
-    wake_mask |= (1U << sid);
   }
 
-  if (wake_mask && engine->wake_fds) {
+  if (wake_mask) {
     uint64_t t3 = PROF_NOW();
-    for (uint32_t sid = 0; sid < nshards; sid++) {
-      if ((wake_mask & (1U << sid)) && engine->wake_fds[sid] >= 0) {
-        uint64_t one = 1;
-        (void)write(engine->wake_fds[sid], &one, sizeof(one));
-      }
-    }
+    shard_flush_wakeup(engine, &wake_mask);
     PROF_RECORD(r->shard->prof.wake_write, t3);
   }
 

@@ -449,8 +449,6 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                            uint32_t pipeline_seq, struct resp_cmd *cmd) {
   struct shard_engine *engine = r->engine;
   uint32_t my_id = r->shard->id;
-  struct spsc_queue *q =
-      &engine->queues[my_id * engine->num_shards + target_shard];
   struct spsc_message msg = {.op = MSG_PACK_OP(MSG_SYS_REQ, cmd_op),
                              .shard_owner = (uint8_t)my_id,
                              .u.regular_req = {
@@ -459,19 +457,11 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                                  .req_nb = c->rbuf_nb,
                                  .pipeline_idx = pipeline_seq,
                              }};
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-  msg.sent_cycles = PROF_NOW();
-#endif
   if (msg.u.regular_req.req_nb)
     net_buf_ref(msg.u.regular_req.req_nb);
-  /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
-   * and rarely fills under normal load. If the target shard stalls (eviction,
-   * snapshot I/O), this busy-wait will add latency to this shard's reactor.
-   * TODO: consider bounded retry with backpressure to the client (e.g. -ERR
-   * BUSY) if the queue remains full after N yields. */
-  spsc_queue_push(q, &msg);
+  shard_send_msg_deferred(engine, my_id, target_shard, &msg,
+                          &r->proxy_wake_mask);
   r->shard->cross_shard_sent++;
-  r->proxy_wake_mask |= (1U << target_shard);
   return true;
 }
 
@@ -732,8 +722,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
         s->multi_replies[i] = (uint8_t *)lrb;
         continue;
       }
-      struct spsc_queue *q =
-          &r->engine->queues[r->shard->id * r->engine->num_shards + i];
       struct spsc_message msg = {.op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DBSIZE),
                                  .shard_owner = (uint8_t)r->shard->id,
                                  .u.dbsize_req = {
@@ -741,17 +729,8 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                                      .pipeline_idx = pipeline_seq,
                                      .sub_idx = i,
                                  }};
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-      msg.sent_cycles = PROF_NOW();
-#endif
-      /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
-       * and rarely fills under normal load. If the target shard stalls
-       * (eviction, snapshot I/O), this busy-wait will add latency to this
-       * shard's reactor.
-       * TODO: consider bounded retry with backpressure to the client (e.g. -ERR
-       * BUSY) if the queue remains full after N yields. */
-      spsc_queue_push(q, &msg);
-      r->proxy_wake_mask |= (1U << i);
+      shard_send_msg_deferred(r->engine, r->shard->id, i, &msg,
+                              &r->proxy_wake_mask);
     }
     if (s->multi_replied >= s->multi_parts)
       s->state = PSLOT_DONE;
@@ -881,7 +860,7 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
 
     /* ── Phase 1: Send MGET_PART to each remote shard ───────────── */
     uint32_t remote_count = 0;
-    uint32_t remote_wake_mask = 0;
+    uint64_t remote_wake_mask = 0;
 
     for (uint32_t i = 0; i < nkeys; i++) {
       const char *pk = p->argv[i + 1];
@@ -914,7 +893,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           s->multi_replied++;
         }
       } else {
-        struct spsc_queue *q = &engine->queues[my_id * nshards + kowner];
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_MGET_PART),
             .shard_owner = (uint8_t)my_id,
@@ -926,31 +904,14 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                 .pipeline_idx = pipeline_seq,
                 .sub_idx = i,
             }};
-#if FREAKV_PROFILE || FREAKV_MIXED_PROFILE
-        msg.sent_cycles = PROF_NOW();
-#endif
         if (msg.u.key_part_req.req_nb)
           net_buf_ref(msg.u.key_part_req.req_nb);
-        spsc_queue_push(q, &msg);
-        remote_wake_mask |= (1U << kowner);
+        shard_send_msg_deferred(engine, my_id, kowner, &msg, &remote_wake_mask);
         remote_count++;
       }
     }
 
-    /* Wake remote shards */
-    if (remote_wake_mask && engine->wake_fds) {
-      uint32_t mask = remote_wake_mask;
-      uint32_t sid = 0;
-      while (mask) {
-        if ((mask & 1) && engine->wake_fds[sid] >= 0) {
-          uint64_t one = 1;
-          if (write(engine->wake_fds[sid], &one, sizeof(one)) < 0) {
-          }
-        }
-        mask >>= 1;
-        sid++;
-      }
-    }
+    shard_flush_wakeup(engine, &remote_wake_mask);
 
     /* ── Phase 2: Wait synchronously for all remote replies ────── */
     uint32_t remote_received = 0;
@@ -1019,26 +980,16 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
               }
               r->shard->ops_completed++;
 
-              struct spsc_queue *rq =
-                  &engine->queues[my_id * nshards + msg.shard_owner];
               struct spsc_message reply = {
                   .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_GET_CMD(msg.op)),
                   .shard_owner = (uint8_t)my_id,
                   .u.reply = msg.u.reply};
-              spsc_queue_push(rq, &reply);
-              if (engine->wake_fds && engine->wake_fds[msg.shard_owner] >= 0) {
-                uint64_t one = 1;
-                if (write(engine->wake_fds[msg.shard_owner], &one,
-                          sizeof(one)) < 0) {
-                }
-              }
+              shard_send_msg_wake(engine, my_id, msg.shard_owner, &reply);
             }
           }
 
-          atomic_store_explicit(&q->wake_edge, 0, memory_order_seq_cst);
-          if (spsc_queue_empty(q))
+          if (spsc_queue_try_disarm_wake(q))
             break;
-          atomic_store_explicit(&q->wake_edge, 1, memory_order_seq_cst);
         }
       }
       if (remote_received < remote_count)
@@ -1125,8 +1076,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           s->multi_replied++;
         }
       } else {
-        struct spsc_queue *q =
-            &r->engine->queues[r->shard->id * r->engine->num_shards + kowner];
         struct spsc_message msg = {
             .op = MSG_PACK_OP(MSG_SYS_REQ, MSG_CMD_DEL_PART),
             .shard_owner = (uint8_t)r->shard->id,
@@ -1140,14 +1089,8 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
             }};
         if (msg.u.key_part_req.req_nb)
           net_buf_ref(msg.u.key_part_req.req_nb);
-        /* Spin until space is available. The queue is large (SPSC_CAPACITY
-         * slots) and rarely fills under normal load. If the target shard stalls
-         * (eviction, snapshot I/O), this busy-wait will add latency to this
-         * shard's reactor.
-         * TODO: consider bounded retry with backpressure to the client (e.g.
-         * -ERR BUSY) if the queue remains full after N yields. */
-        spsc_queue_push(q, &msg);
-        r->proxy_wake_mask |= (1U << kowner);
+        shard_send_msg_deferred(r->engine, r->shard->id, kowner, &msg,
+                                &r->proxy_wake_mask);
       }
     }
     if (s->multi_replied >= s->multi_parts)
@@ -1380,25 +1323,7 @@ static void handle_read_resp(struct reactor *r, struct net_conn *c) {
   }
 
   /* 5. Batch wake up shards that received cross-shard traffic */
-  if (r->proxy_wake_mask) {
-    uint32_t mask = r->proxy_wake_mask;
-    r->proxy_wake_mask = 0;
-    if (r->engine->wake_fds) {
-      uint32_t s = 0;
-      while (mask) {
-        if (mask & 1) {
-          if (r->engine->wake_fds[s] >= 0) {
-            uint64_t one = 1;
-            if (write(r->engine->wake_fds[s], &one, sizeof(one)) <
-                0) { /* handle warn silently */
-            }
-          }
-        }
-        mask >>= 1;
-        s++;
-      }
-    }
-  }
+  shard_flush_wakeup(r->engine, &r->proxy_wake_mask);
 }
 
 #endif /* RESP_HANDLER_H */

@@ -336,26 +336,14 @@ static void net_remote_obj_release(struct reactor *r, uint8_t owner_shard,
     return;
   }
 
-  struct spsc_message rel = {.op = MSG_PACK_OP(MSG_SYS_RELEASE, 0),
+  struct spsc_message msg = {.op = MSG_PACK_OP(MSG_SYS_RELEASE, 0),
                              .shard_owner = (uint8_t)r->shard->id,
                              .u.release = {
                                  .kv_obj_ptr = kv_obj_ptr,
                                  .reply_buf = reply_buf,
                              }};
-  struct spsc_queue *rq =
-      &r->engine->queues[r->shard->id * r->engine->num_shards + owner_shard];
-  /* Spin until space is available. The queue is large (SPSC_CAPACITY slots)
-   * and rarely fills under normal load. If the target shard stalls (eviction,
-   * snapshot I/O), this busy-wait will add latency to this shard's reactor.
-   * TODO: consider bounded retry with backpressure to the client (e.g. -ERR
-   * BUSY) if the queue remains full after N yields. */
-  while (true) {
-    if (spsc_queue_push(rq, &rel)) {
-      r->proxy_wake_mask |= (1U << owner_shard);
-      return;
-    }
-    sched_yield();
-  }
+  shard_send_msg_deferred(r->engine, r->shard->id, owner_shard, &msg,
+                          &r->proxy_wake_mask);
 }
 
 /* ── Per-slot reset (cleanup resources) ──────────────────────────────── */
