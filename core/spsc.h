@@ -34,6 +34,8 @@ struct spsc_queue {
 
   /* Shared state for inter-shard visibility */
   alignas(64) _Atomic(struct spsc_segment *) c_seg_shared; /* Updated by Consumer, read by Producer */
+
+  _Atomic int wake_edge;
 };
 
 /*
@@ -54,7 +56,7 @@ static inline bool spsc_queue_init(struct spsc_queue *q, struct slab_allocator *
   q->c_seg = seg;
   q->allocator = alloc;
   atomic_init(&q->c_seg_shared, seg);
-
+  atomic_init(&q->wake_edge, 0);
   return true;
 }
 

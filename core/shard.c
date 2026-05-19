@@ -1,5 +1,6 @@
 #include "shard.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,8 +226,7 @@ static inline void obj_destroy(struct shard *s, struct kv_obj *o) {
 struct kv_obj *shard_bucket_put(struct shard *s, struct kv_obj *obj,
                                 enum val_type type, uint64_t expire_ms,
                                 uint32_t put_flags) {
-  struct kv_obj *old =
-      ht_bucket_put(s->table, obj, type, expire_ms, put_flags);
+  struct kv_obj *old = ht_bucket_put(s->table, obj, type, expire_ms, put_flags);
   if (old == (struct kv_obj *)(uintptr_t)-1 && shard_mem_evict(s, 0)) {
     old = ht_bucket_put(s->table, obj, type, expire_ms, put_flags);
   }
@@ -773,158 +773,166 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
     struct spsc_message msg;
     uint32_t wake_mask = 0;
     uint32_t sender_run = 0;
-    while (spsc_queue_pop(q, &msg)) {
-      if (drain_prof) {
-        total_msgs++;
-        sender_run++;
-      }
-      uint8_t sys_op = MSG_GET_SYS(msg.op);
-      if (sys_op == MSG_SYS_REPLY) {
-        if (drain_prof)
-          reply_msgs++;
-        if (proxy_cb)
-          proxy_cb(proxy_ctx, &msg);
-        continue;
-      }
-
-      if (sys_op == MSG_SYS_RELEASE) {
-        if (drain_prof)
-          release_msgs++;
-        if (msg.u.release.kv_obj_ptr)
-          shard_obj_unref(shard, (struct kv_obj *)msg.u.release.kv_obj_ptr);
-        if (msg.u.release.reply_buf)
-          slab_obj_free(shard->pool, msg.u.release.reply_buf);
-        continue;
-      }
-
-      if (sys_op == MSG_SYS_REQ) {
-        if (drain_prof)
-          req_msgs++;
-        if (!cur)
-          cur = shard_now_ms();
-        uint16_t cmd_op = MSG_GET_CMD(msg.op);
-        bool mix_prof = mixed_profile_enabled();
-        uint64_t q_cycles = 0;
-        uint64_t t_msg = 0;
-        if (mix_prof) {
-          uint64_t now_c = PROF_NOW();
-#if FREAKV_MIXED_PROFILE
-          q_cycles = msg.sent_cycles ? now_c - msg.sent_cycles : 0;
-#else
-          q_cycles = 0;
-#endif
-          t_msg = now_c;
-        }
-
-        /* ── Async MSET handlers ──────────────────────────────────── */
-        if (cmd_op == MSG_CMD_MSET_KEY) {
-          if (drain_prof)
-            mset_key_msgs++;
-          mset_on_prepare(engine, shard, &msg, cur);
-          if (mix_prof) {
-            uint64_t dur = PROF_NOW() - t_msg;
-            uint64_t slow = mixed_profile_slow_cycles();
-            if (dur >= slow || q_cycles >= slow)
-              fprintf(stderr,
-                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
-                      "durcy=%lu deferred=0 ops=1\n",
-                      shard->id, mixed_cmd_name(cmd_op), sender,
-                      (unsigned long)q_cycles, (unsigned long)dur);
-          }
-          shard->cross_shard_received++;
-          continue;
-        }
-
-        if (cmd_op == MSG_CMD_MSET_KEY_BATCH) {
-          if (drain_prof)
-            mset_batch_msgs++;
-          uint32_t batch_count =
-              msg.u.mset_prepare_batch.batch
-                  ? msg.u.mset_prepare_batch.batch->count
-                  : 0;
-          mset_on_prepare_batch(engine, shard, &msg, cur);
-          if (mix_prof) {
-            uint64_t dur = PROF_NOW() - t_msg;
-            uint64_t slow = mixed_profile_slow_cycles();
-            if (dur >= slow || q_cycles >= slow)
-              fprintf(stderr,
-                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
-                      "durcy=%lu deferred=0 ops=%u\n",
-                      shard->id, mixed_cmd_name(cmd_op), sender,
-                      (unsigned long)q_cycles, (unsigned long)dur, batch_count);
-          }
-          shard->cross_shard_received++;
-          continue;
-        }
-
-        if (cmd_op == MSG_CMD_MSET_FIN) {
-          if (drain_prof)
-            mset_fin_msgs++;
-          mset_on_fin(engine, shard, &msg, cur);
-          if (mix_prof) {
-            uint64_t dur = PROF_NOW() - t_msg;
-            uint64_t slow = mixed_profile_slow_cycles();
-            if (dur >= slow || q_cycles >= slow)
-              fprintf(stderr,
-                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
-                      "durcy=%lu deferred=0 ops=0\n",
-                      shard->id, mixed_cmd_name(cmd_op), sender,
-                      (unsigned long)q_cycles, (unsigned long)dur);
-          }
-          shard->cross_shard_received++;
-          continue;
-        }
-
-        /* ── Normal request path ──────────────────────────────────── */
+    while (true) {
+      while (spsc_queue_pop(q, &msg)) {
         if (drain_prof) {
-          if (cmd_op == MSG_CMD_SET || cmd_op == MSG_CMD_SET_NX ||
-              cmd_op == MSG_CMD_SET_XX)
-            set_msgs++;
-          else
-            other_req_msgs++;
+          total_msgs++;
+          sender_run++;
         }
-        struct net_buf *req_nb = NULL;
-        if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART)
-          req_nb = msg.u.key_part_req.req_nb;
-        else if (cmd_op != MSG_CMD_DBSIZE)
-          req_nb = msg.u.regular_req.req_nb;
-        enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
-        if (mix_prof) {
-          uint64_t dur = PROF_NOW() - t_msg;
-          uint64_t slow = mixed_profile_slow_cycles();
-          if (dur >= slow || q_cycles >= slow || exec_rc == PROXY_EXEC_DEFERRED)
-            fprintf(stderr,
-                    "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
-                    "durcy=%lu deferred=%d ops=1\n",
-                    shard->id, mixed_cmd_name(cmd_op), sender,
-                    (unsigned long)q_cycles, (unsigned long)dur,
-                    exec_rc == PROXY_EXEC_DEFERRED);
-        }
-
-        shard->cross_shard_received++;
-        if (exec_rc == PROXY_EXEC_DEFERRED) {
-          if (req_nb)
-            net_buf_unref(shard->pool, req_nb);
+        uint8_t sys_op = MSG_GET_SYS(msg.op);
+        if (sys_op == MSG_SYS_REPLY) {
+          if (drain_prof)
+            reply_msgs++;
+          if (proxy_cb)
+            proxy_cb(proxy_ctx, &msg);
           continue;
         }
 
-        shard->ops_completed++;
+        if (sys_op == MSG_SYS_RELEASE) {
+          if (drain_prof)
+            release_msgs++;
+          if (msg.u.release.kv_obj_ptr)
+            shard_obj_unref(shard, (struct kv_obj *)msg.u.release.kv_obj_ptr);
+          if (msg.u.release.reply_buf)
+            slab_obj_free(shard->pool, msg.u.release.reply_buf);
+          continue;
+        }
 
-        struct spsc_queue *rq =
-            &engine->queues[shard->id * engine->num_shards + msg.shard_owner];
-        struct spsc_message reply = {
-            .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
-            .shard_owner = (uint8_t)shard->id,
-            .u.reply = msg.u.reply,
-        };
-        while (true) {
-          if (spsc_queue_push(rq, &reply)) {
-            wake_mask |= (1U << msg.shard_owner);
-            break;
+        if (sys_op == MSG_SYS_REQ) {
+          if (drain_prof)
+            req_msgs++;
+          if (!cur)
+            cur = shard_now_ms();
+          uint16_t cmd_op = MSG_GET_CMD(msg.op);
+          bool mix_prof = mixed_profile_enabled();
+          uint64_t q_cycles = 0;
+          uint64_t t_msg = 0;
+          if (mix_prof) {
+            uint64_t now_c = PROF_NOW();
+#if FREAKV_MIXED_PROFILE
+            q_cycles = msg.sent_cycles ? now_c - msg.sent_cycles : 0;
+#else
+            q_cycles = 0;
+#endif
+            t_msg = now_c;
           }
-          sched_yield();
+
+          /* ── Async MSET handlers ──────────────────────────────────── */
+          if (cmd_op == MSG_CMD_MSET_KEY) {
+            if (drain_prof)
+              mset_key_msgs++;
+            mset_on_prepare(engine, shard, &msg, cur);
+            if (mix_prof) {
+              uint64_t dur = PROF_NOW() - t_msg;
+              uint64_t slow = mixed_profile_slow_cycles();
+              if (dur >= slow || q_cycles >= slow)
+                fprintf(stderr,
+                        "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                        "durcy=%lu deferred=0 ops=1\n",
+                        shard->id, mixed_cmd_name(cmd_op), sender,
+                        (unsigned long)q_cycles, (unsigned long)dur);
+            }
+            shard->cross_shard_received++;
+            continue;
+          }
+
+          if (cmd_op == MSG_CMD_MSET_KEY_BATCH) {
+            if (drain_prof)
+              mset_batch_msgs++;
+            uint32_t batch_count = msg.u.mset_prepare_batch.batch
+                                       ? msg.u.mset_prepare_batch.batch->count
+                                       : 0;
+            mset_on_prepare_batch(engine, shard, &msg, cur);
+            if (mix_prof) {
+              uint64_t dur = PROF_NOW() - t_msg;
+              uint64_t slow = mixed_profile_slow_cycles();
+              if (dur >= slow || q_cycles >= slow)
+                fprintf(stderr,
+                        "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                        "durcy=%lu deferred=0 ops=%u\n",
+                        shard->id, mixed_cmd_name(cmd_op), sender,
+                        (unsigned long)q_cycles, (unsigned long)dur,
+                        batch_count);
+            }
+            shard->cross_shard_received++;
+            continue;
+          }
+
+          if (cmd_op == MSG_CMD_MSET_FIN) {
+            if (drain_prof)
+              mset_fin_msgs++;
+            mset_on_fin(engine, shard, &msg, cur);
+            if (mix_prof) {
+              uint64_t dur = PROF_NOW() - t_msg;
+              uint64_t slow = mixed_profile_slow_cycles();
+              if (dur >= slow || q_cycles >= slow)
+                fprintf(stderr,
+                        "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                        "durcy=%lu deferred=0 ops=0\n",
+                        shard->id, mixed_cmd_name(cmd_op), sender,
+                        (unsigned long)q_cycles, (unsigned long)dur);
+            }
+            shard->cross_shard_received++;
+            continue;
+          }
+
+          /* ── Normal request path ──────────────────────────────────── */
+          if (drain_prof) {
+            if (cmd_op == MSG_CMD_SET || cmd_op == MSG_CMD_SET_NX ||
+                cmd_op == MSG_CMD_SET_XX)
+              set_msgs++;
+            else
+              other_req_msgs++;
+          }
+          struct net_buf *req_nb = NULL;
+          if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART)
+            req_nb = msg.u.key_part_req.req_nb;
+          else if (cmd_op != MSG_CMD_DBSIZE)
+            req_nb = msg.u.regular_req.req_nb;
+          enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
+          if (mix_prof) {
+            uint64_t dur = PROF_NOW() - t_msg;
+            uint64_t slow = mixed_profile_slow_cycles();
+            if (dur >= slow || q_cycles >= slow ||
+                exec_rc == PROXY_EXEC_DEFERRED)
+              fprintf(stderr,
+                      "[MSET_MIXED_MSG] shard=%u cmd=%s sender=%u qcy=%lu "
+                      "durcy=%lu deferred=%d ops=1\n",
+                      shard->id, mixed_cmd_name(cmd_op), sender,
+                      (unsigned long)q_cycles, (unsigned long)dur,
+                      exec_rc == PROXY_EXEC_DEFERRED);
+          }
+
+          shard->cross_shard_received++;
+          if (exec_rc == PROXY_EXEC_DEFERRED) {
+            if (req_nb)
+              net_buf_unref(shard->pool, req_nb);
+            continue;
+          }
+
+          shard->ops_completed++;
+
+          struct spsc_queue *rq =
+              &engine->queues[shard->id * engine->num_shards + msg.shard_owner];
+          struct spsc_message reply = {
+              .op = MSG_PACK_OP(MSG_SYS_REPLY, cmd_op),
+              .shard_owner = (uint8_t)shard->id,
+              .u.reply = msg.u.reply,
+          };
+          while (true) {
+            if (spsc_queue_push(rq, &reply)) {
+              wake_mask |= (1U << msg.shard_owner);
+              break;
+            }
+            sched_yield();
+          }
         }
       }
+
+      atomic_store_explicit(&q->wake_edge, 0, memory_order_seq_cst);
+      if (spsc_queue_empty(q))
+        break;
+      atomic_store_explicit(&q->wake_edge, 1, memory_order_seq_cst);
     }
     if (drain_prof && sender_run > max_sender_run)
       max_sender_run = sender_run;
@@ -1178,8 +1186,8 @@ void shard_engine_stats_print(const struct shard_engine *e) {
 
   printf("  MSET Connection-Level Pending\n");
   printf("-----------------------------------------------------------\n");
-  printf("%-6s %-14s %-14s %-10s %-10s\n", "shard", "enqueued",
-         "resumed", "cur_len", "max_len");
+  printf("%-6s %-14s %-14s %-10s %-10s\n", "shard", "enqueued", "resumed",
+         "cur_len", "max_len");
   uint64_t pending_enq = 0, pending_res = 0;
   uint32_t pending_cur = 0, pending_max = 0;
   for (uint32_t i = 0; i < e->num_shards; i++) {
@@ -1433,11 +1441,10 @@ void shard_engine_stats_print(const struct shard_engine *e) {
 
 bool shard_mem_evict(struct shard *s, size_t size_req) {
   bool force_entry_eviction = size_req == 0;
-  uint32_t target_pidx = force_entry_eviction
-                             ? NR_SMALL_POOLS
-                             : (size_req <= SMALL_ALLOC_MAX
-                                    ? pool_idx_get(size_req)
-                                    : NR_SMALL_POOLS);
+  uint32_t target_pidx = force_entry_eviction ? NR_SMALL_POOLS
+                                              : (size_req <= SMALL_ALLOC_MAX
+                                                     ? pool_idx_get(size_req)
+                                                     : NR_SMALL_POOLS);
   uint32_t buddy_pages_needed = 0;
   if (force_entry_eviction) {
     buddy_pages_needed = 0;

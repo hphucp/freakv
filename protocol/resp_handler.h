@@ -13,6 +13,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,8 +29,6 @@ static int resp_wbuf_append(struct reactor *r, struct net_conn *c,
 static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c);
 static void net_reactor_proxy_reply_callback(void *ctx,
                                              const struct spsc_message *msg);
-
-
 
 /* ── Buffer grow (partial copy to preserve the in-progress command) ──── */
 
@@ -500,8 +499,7 @@ static uint64_t resp_mixed_profile_slow_cycles(void) {
 static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
                                 uint16_t cmd_op, uint32_t pipeline_seq,
                                 struct resp_parser *p,
-                                struct net_pipeline_slot *s,
-                                uint64_t now) {
+                                struct net_pipeline_slot *s, uint64_t now) {
   s->state = PSLOT_PENDING;
   s->shard_owner = r->shard->id;
   s->cmd.argc = (uint32_t)p->argc_got;
@@ -532,12 +530,13 @@ static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
   struct spsc_message msg = {
       .op = MSG_PACK_OP(MSG_SYS_REQ, cmd_op),
       .shard_owner = (uint8_t)r->shard->id,
-      .u.regular_req = {
-          .cmd = s->cmd,
-          .conn_ptr = c,
-          .req_nb = c->rbuf_nb,
-          .pipeline_idx = pipeline_seq,
-      },
+      .u.regular_req =
+          {
+              .cmd = s->cmd,
+              .conn_ptr = c,
+              .req_nb = c->rbuf_nb,
+              .pipeline_idx = pipeline_seq,
+          },
   };
   bool prof = resp_mixed_profile_enabled();
   uint64_t t_exec = prof ? cycles_now() : 0;
@@ -632,10 +631,12 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                               VAL_TYPE_STRING)) {
         uint16_t cmd_op = MSG_CMD_SET;
         for (int i = 3; i < p->argc_got; i++) {
-          char opt0 =
-              p->arglen[i] > 0 ? (char)toupper((unsigned char)p->argv[i][0]) : 0;
-          char opt1 =
-              p->arglen[i] > 1 ? (char)toupper((unsigned char)p->argv[i][1]) : 0;
+          char opt0 = p->arglen[i] > 0
+                          ? (char)toupper((unsigned char)p->argv[i][0])
+                          : 0;
+          char opt1 = p->arglen[i] > 1
+                          ? (char)toupper((unsigned char)p->argv[i][1])
+                          : 0;
           if (p->arglen[i] == 2 && opt0 == 'N' && opt1 == 'X')
             cmd_op = MSG_CMD_SET_NX;
           else if (p->arglen[i] == 2 && opt0 == 'X' && opt1 == 'X')
@@ -963,75 +964,81 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
           continue;
 
         struct spsc_message msg;
-        while (spsc_queue_pop(q, &msg)) {
-          uint8_t sys_op = MSG_GET_SYS(msg.op);
-          uint16_t cmd_id = MSG_GET_CMD(msg.op);
+        while (true) {
+          while (spsc_queue_pop(q, &msg)) {
+            uint8_t sys_op = MSG_GET_SYS(msg.op);
+            uint16_t cmd_id = MSG_GET_CMD(msg.op);
 
-          if (sys_op == MSG_SYS_RELEASE) {
-            if (msg.u.release.kv_obj_ptr)
-              shard_obj_unref(r->shard,
-                              (struct kv_obj *)msg.u.release.kv_obj_ptr);
-            if (msg.u.release.reply_buf)
-              slab_obj_free(r->shard->pool, msg.u.release.reply_buf);
-            continue;
-          }
-
-          if (sys_op == MSG_SYS_REPLY) {
-            if (cmd_id == MSG_CMD_MGET_PART && msg.u.reply.conn_ptr == c &&
-                msg.u.reply.pipeline_idx == pipeline_seq) {
-              /* This is one of our MGET replies */
-              uint32_t sidx = msg.u.reply.sub_idx;
-              if (sidx < nkeys) {
-                s->multi_replies[sidx] = (uint8_t *)msg.u.reply.reply_buf;
-                s->multi_reply_lens[sidx] = msg.u.reply.reply_len;
-                if (s->multi_kv_objs)
-                  s->multi_kv_objs[sidx] = msg.u.reply.kv_obj_ptr;
-                if (s->multi_owners)
-                  s->multi_owners[sidx] = msg.shard_owner;
-                s->multi_replied++;
-              }
-              remote_received++;
-              if (msg.u.reply.req_nb)
-                net_buf_unref(r->shard->pool, msg.u.reply.req_nb);
+            if (sys_op == MSG_SYS_RELEASE) {
+              if (msg.u.release.kv_obj_ptr)
+                shard_obj_unref(r->shard,
+                                (struct kv_obj *)msg.u.release.kv_obj_ptr);
+              if (msg.u.release.reply_buf)
+                slab_obj_free(r->shard->pool, msg.u.release.reply_buf);
               continue;
             }
-            /* Non-MGET reply — forward normally */
-            net_reactor_proxy_reply_callback(r, &msg);
-            continue;
-          }
 
-          /* Normal REQ during lock hold — process it */
-          if (sys_op == MSG_SYS_REQ) {
-            uint64_t cur = net_time_ms_get();
-            enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, cur);
-            r->shard->cross_shard_received++;
-            if (exec_rc == PROXY_EXEC_DEFERRED) {
-              uint16_t deferred_cmd = MSG_GET_CMD(msg.op);
-              struct net_buf *req_nb =
-                  (deferred_cmd == MSG_CMD_MGET_PART ||
-                   deferred_cmd == MSG_CMD_DEL_PART)
-                      ? msg.u.key_part_req.req_nb
-                      : msg.u.regular_req.req_nb;
-              if (req_nb)
-                net_buf_unref(r->shard->pool, req_nb);
+            if (sys_op == MSG_SYS_REPLY) {
+              if (cmd_id == MSG_CMD_MGET_PART && msg.u.reply.conn_ptr == c &&
+                  msg.u.reply.pipeline_idx == pipeline_seq) {
+                /* This is one of our MGET replies */
+                uint32_t sidx = msg.u.reply.sub_idx;
+                if (sidx < nkeys) {
+                  s->multi_replies[sidx] = (uint8_t *)msg.u.reply.reply_buf;
+                  s->multi_reply_lens[sidx] = msg.u.reply.reply_len;
+                  if (s->multi_kv_objs)
+                    s->multi_kv_objs[sidx] = msg.u.reply.kv_obj_ptr;
+                  if (s->multi_owners)
+                    s->multi_owners[sidx] = msg.shard_owner;
+                  s->multi_replied++;
+                }
+                remote_received++;
+                if (msg.u.reply.req_nb)
+                  net_buf_unref(r->shard->pool, msg.u.reply.req_nb);
+                continue;
+              }
+              /* Non-MGET reply — forward normally */
+              net_reactor_proxy_reply_callback(r, &msg);
               continue;
             }
-            r->shard->ops_completed++;
 
-            struct spsc_queue *rq =
-                &engine->queues[my_id * nshards + msg.shard_owner];
-            struct spsc_message reply = {
-                .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_GET_CMD(msg.op)),
-                .shard_owner = (uint8_t)my_id,
-                .u.reply = msg.u.reply};
-            spsc_queue_push(rq, &reply);
-            if (engine->wake_fds && engine->wake_fds[msg.shard_owner] >= 0) {
-              uint64_t one = 1;
-              if (write(engine->wake_fds[msg.shard_owner], &one, sizeof(one)) <
-                  0) {
+            /* Normal REQ during lock hold — process it */
+            if (sys_op == MSG_SYS_REQ) {
+              uint64_t cur = net_time_ms_get();
+              enum proxy_exec_result exec_rc = proxy_exec(r->shard, &msg, cur);
+              r->shard->cross_shard_received++;
+              if (exec_rc == PROXY_EXEC_DEFERRED) {
+                uint16_t deferred_cmd = MSG_GET_CMD(msg.op);
+                struct net_buf *req_nb = (deferred_cmd == MSG_CMD_MGET_PART ||
+                                          deferred_cmd == MSG_CMD_DEL_PART)
+                                             ? msg.u.key_part_req.req_nb
+                                             : msg.u.regular_req.req_nb;
+                if (req_nb)
+                  net_buf_unref(r->shard->pool, req_nb);
+                continue;
+              }
+              r->shard->ops_completed++;
+
+              struct spsc_queue *rq =
+                  &engine->queues[my_id * nshards + msg.shard_owner];
+              struct spsc_message reply = {
+                  .op = MSG_PACK_OP(MSG_SYS_REPLY, MSG_GET_CMD(msg.op)),
+                  .shard_owner = (uint8_t)my_id,
+                  .u.reply = msg.u.reply};
+              spsc_queue_push(rq, &reply);
+              if (engine->wake_fds && engine->wake_fds[msg.shard_owner] >= 0) {
+                uint64_t one = 1;
+                if (write(engine->wake_fds[msg.shard_owner], &one,
+                          sizeof(one)) < 0) {
+                }
               }
             }
           }
+
+          atomic_store_explicit(&q->wake_edge, 0, memory_order_seq_cst);
+          if (spsc_queue_empty(q))
+            break;
+          atomic_store_explicit(&q->wake_edge, 1, memory_order_seq_cst);
         }
       }
       if (remote_received < remote_count)
@@ -1077,7 +1084,7 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
      * so kv_obj_ptr is NOT overwritten. Verify here for safety. */
     /* Async MSET dispatched */
 
-    return rc == 1 ? 3 : 1;  /* 3: connection-level pending */
+    return rc == 1 ? 3 : 1; /* 3: connection-level pending */
   }
 
   if (strcmp(cmd, "DEL") == 0) {
