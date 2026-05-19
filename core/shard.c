@@ -31,7 +31,7 @@ void shard_send_msg_wake(struct shard_engine *engine, uint32_t from,
   while (!spsc_queue_push(q, msg))
     sched_yield();
 
-  if (atomic_exchange_explicit(&q->wake_edge, 1, memory_order_seq_cst) == 0)
+  if (atomic_exchange_explicit(&q->wake_edge, 1, memory_order_release) == 0)
     shard_wakeup_one(engine, to);
 }
 
