@@ -49,7 +49,6 @@ static inline uint64_t net_time_ms_get(void) {
 static inline void net_reactor_mark_dirty(struct reactor *r,
                                           struct net_conn *c);
 
-/* ── struct net_conn lifecycle ───────────────────────────────────────── */
 
 static struct net_conn *net_conn_alloc(struct reactor *r) {
   struct net_conn *c = (struct net_conn *)slab_obj_alloc(
@@ -64,7 +63,7 @@ static struct net_conn *net_conn_alloc(struct reactor *r) {
   c->list_type = 0;
   c->allocator = r->shard->pool;
 
-  c->rbuf_nb = net_buf_alloc(r->shard->pool, 4096);
+  c->rbuf_nb = net_rbuf_alloc(r->shard->pool, 4096);
   if (!c->rbuf_nb) {
     slab_obj_free(r->shard->pool, c);
     return NULL;
@@ -86,7 +85,7 @@ static void net_conn_free(struct reactor *r, struct net_conn *c) {
     return;
   mset_pending_conn_cancel(r->shard, c);
   if (c->rbuf_nb)
-    net_buf_unref(r->shard->pool, c->rbuf_nb);
+    net_rbuf_try_free(r->shard->pool, c->rbuf_nb);
   if (c->wbuf)
     slab_obj_free(r->shard->pool, c->wbuf);
   resp_parser_free(&c->resp);
@@ -271,7 +270,7 @@ static void net_slot_reset(struct reactor *r, struct net_pipeline_slot *s) {
 
   /* Release input buffer ref */
   if (s->req_nb) {
-    net_buf_unref(r->shard->pool, s->req_nb);
+    net_rbuf_try_free(r->shard->pool, s->req_nb);
     s->req_nb = NULL;
   }
 
@@ -650,10 +649,7 @@ static void net_reactor_proxy_reply_callback(void *ctx,
       net_reactor_mark_dirty_reason(r, c, "mset_fin_ack");
     return;
   }
-
-  if (msg->u.reply.req_nb)
-    net_buf_unref(r->shard->pool, msg->u.reply.req_nb);
-
+  
   struct net_conn *c = (struct net_conn *)msg->u.reply.conn_ptr;
   if (!c) {
     net_remote_obj_release(r, msg->shard_owner, msg->u.reply.kv_obj_ptr,

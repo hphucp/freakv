@@ -44,7 +44,7 @@ static int net_rbuf_grow(struct net_conn *c, size_t need) {
   while (newcap < min_cap)
     newcap *= 2;
 
-  struct net_buf *nb = net_buf_alloc(c->allocator, newcap);
+  struct net_buf *nb = net_rbuf_alloc(c->allocator, newcap);
   if (!nb)
     return -1;
 
@@ -58,7 +58,7 @@ static int net_rbuf_grow(struct net_conn *c, size_t need) {
     if (c->resp.argv[i])
       c->resp.argv[i] += delta;
 
-  net_buf_unref(c->allocator, c->rbuf_nb);
+  net_rbuf_try_free(c->allocator, c->rbuf_nb);
   c->rbuf_nb = nb;
   c->rbuf_len = partial_len;
   c->resp.rbuf_parsed -= c->resp.cmd_start;
@@ -442,7 +442,6 @@ static void resp_dispatch(struct reactor *r, struct net_conn *c,
   resp_reply_err(r, c, "unknown command");
 }
 
-/* ── Proxy dispatch ──────────────────────────────────────────────────── */
 
 static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                            uint32_t target_shard, uint16_t cmd_op,
@@ -457,8 +456,6 @@ static bool proxy_send_req(struct reactor *r, struct net_conn *c,
                                  .req_nb = c->rbuf_nb,
                                  .pipeline_idx = pipeline_seq,
                              }};
-  if (msg.u.regular_req.req_nb)
-    net_buf_ref(msg.u.regular_req.req_nb);
   shard_send_msg_deferred(engine, my_id, target_shard, &msg,
                           &r->proxy_wake_mask);
   r->shard->cross_shard_sent++;
@@ -489,11 +486,6 @@ static int proxy_exec_local_key(struct reactor *r, struct net_conn *c,
   for (uint32_t i = 0; i < s->cmd.argc; i++) {
     s->cmd.argv[i] = p->argv[i];
     s->cmd.arglen[i] = p->arglen[i];
-  }
-
-  if (!s->req_nb) {
-    net_buf_ref(c->rbuf_nb);
-    s->req_nb = c->rbuf_nb;
   }
 
   struct spsc_message msg = {
@@ -533,7 +525,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
   char c2 = p->arglen[0] > 2 ? (char)toupper((unsigned char)p->argv[0][2]) : 0;
   size_t alen = p->arglen[0];
 
-  /* Sub-microsecond Ultra-Fast Path */
   if (alen == 3 && c0 == 'G' && c1 == 'E' && c2 == 'T') {
     if (p->argc_got != 2 || !c->is_shared) {
       resp_dispatch(r, c, s);
@@ -551,8 +542,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
     }
 
     s->state = PSLOT_PENDING;
-    net_buf_ref(c->rbuf_nb);
-    s->req_nb = c->rbuf_nb;
 
     struct resp_cmd r_cmd = {
         .argc = p->argc_got,
@@ -605,8 +594,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
     }
 
     s->state = PSLOT_PENDING;
-    net_buf_ref(c->rbuf_nb);
-    s->req_nb = c->rbuf_nb;
 
     uint16_t cmd_op = MSG_CMD_SET;
     for (int i = 3; i < p->argc_got; i++) {
@@ -795,8 +782,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
   }
 
   s->state = PSLOT_PENDING;
-  net_buf_ref(c->rbuf_nb);
-  s->req_nb = c->rbuf_nb;
 
   if (strcmp(cmd, "MGET") == 0) {
     uint32_t nkeys = (uint32_t)p->argc_got - 1;
@@ -867,8 +852,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                 .pipeline_idx = pipeline_seq,
                 .sub_idx = i,
             }};
-        if (msg.u.key_part_req.req_nb)
-          net_buf_ref(msg.u.key_part_req.req_nb);
         shard_send_msg_deferred(engine, my_id, kowner, &msg, &remote_wake_mask);
         remote_count++;
       }
@@ -917,8 +900,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                   s->multi_replied++;
                 }
                 remote_received++;
-                if (msg.u.reply.req_nb)
-                  net_buf_unref(r->shard->pool, msg.u.reply.req_nb);
                 continue;
               }
               /* Non-MGET reply — forward normally */
@@ -933,12 +914,7 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
               r->shard->cross_shard_received++;
               if (exec_rc == PROXY_EXEC_DEFERRED) {
                 uint16_t deferred_cmd = MSG_GET_CMD(msg.op);
-                struct net_buf *req_nb = (deferred_cmd == MSG_CMD_MGET_PART ||
-                                          deferred_cmd == MSG_CMD_DEL_PART)
-                                             ? msg.u.key_part_req.req_nb
-                                             : msg.u.regular_req.req_nb;
-                if (req_nb)
-                  net_buf_unref(r->shard->pool, req_nb);
+                
                 continue;
               }
               r->shard->ops_completed++;
@@ -980,14 +956,10 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
      *  3. Return 1 (PSLOT_PENDING) so the caller does NOT overwrite s->state.
      */
     s->state = PSLOT_PENDING;
-    net_buf_ref(c->rbuf_nb);
-    s->req_nb = c->rbuf_nb;
 
     int rc = mset_coordinator_dispatch(r, c, p, pipeline_seq);
     if (rc < 0) {
       s->state = PSLOT_EMPTY;
-      net_buf_unref(c->allocator, c->rbuf_nb);
-      s->req_nb = NULL;
       resp_reply_err(r, c, "OOM");
       return 0;
     }
@@ -1050,8 +1022,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
                 .pipeline_idx = pipeline_seq,
                 .sub_idx = i,
             }};
-        if (msg.u.key_part_req.req_nb)
-          net_buf_ref(msg.u.key_part_req.req_nb);
         shard_send_msg_deferred(r->engine, r->shard->id, kowner, &msg,
                                 &r->proxy_wake_mask);
       }
@@ -1091,8 +1061,6 @@ static int resp_dispatch_proxy(struct reactor *r, struct net_conn *c,
 
   if (!proxy_send_req(r, c, owner, cmd_op, pipeline_seq, &s->cmd)) {
     s->state = PSLOT_EMPTY;
-    net_buf_unref(c->allocator, c->rbuf_nb);
-    s->req_nb = NULL;
     resp_reply_err(r, c, "shard queue full");
     return 0;
   }
@@ -1238,8 +1206,9 @@ static void handle_read_resp(struct reactor *r, struct net_conn *c) {
           net_reactor_mark_dead(r, c);
           return;
         }
-
         struct net_pipeline_slot *s = &c->proxy.slots[seq & (c->proxy.cap - 1)];
+        net_rbuf_ref(c->rbuf_nb);
+        s->req_nb = c->rbuf_nb;
         size_t w0 = c->wbuf_len;
 
         int ret = resp_dispatch_proxy(r, c, seq, batch_now_ms);

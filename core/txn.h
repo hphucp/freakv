@@ -184,10 +184,6 @@ static inline struct cmd_info *cmd_info_alloc(struct slab_allocator *pool) {
 
 static inline void cmd_info_free(struct slab_allocator *pool, struct cmd_info *ci) {
     if (!ci) return;
-    if (ci->req_nb) {
-        net_buf_unref(pool, ci->req_nb);
-        ci->req_nb = NULL;
-    }
     slab_obj_free(pool, ci);
 }
 

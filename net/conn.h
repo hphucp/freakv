@@ -34,33 +34,39 @@ enum conn_pending_reason {
 
 /* ── struct net_buf ────────────────────────────────────────────────── */
 struct net_buf {
-  atomic_uint refcount;
+  int refcount;
   size_t cap;
   uint8_t data[];
 };
 
-static inline struct net_buf *net_buf_alloc(struct slab_allocator *allocator,
+static inline struct net_buf *net_rbuf_alloc(struct slab_allocator *allocator,
                                             size_t cap) {
   struct net_buf *nb =
       (struct net_buf *)slab_obj_alloc(allocator, sizeof(struct net_buf) + cap);
   if (!nb)
     return NULL;
-  atomic_init(&nb->refcount, 1);
+  nb->refcount = 1;
   nb->cap = cap;
   return nb;
 }
 
-static inline void net_buf_ref(struct net_buf *nb) {
+static inline int net_rbuf_ref(struct net_buf *nb) {
   if (nb)
-    atomic_fetch_add_explicit(&nb->refcount, 1, memory_order_relaxed);
+    return ++nb->refcount;
+  return 0;
 }
 
-static inline void net_buf_unref(struct slab_allocator *allocator,
-                                 struct net_buf *nb) {
-  if (nb &&
-      atomic_fetch_sub_explicit(&nb->refcount, 1, memory_order_acq_rel) == 1) {
+static inline int net_rbuf_unref(struct net_buf *nb) {
+  if (nb)                          
+    return --nb->refcount;
+  return 0;
+}
+
+static inline bool net_rbuf_try_free(struct slab_allocator *allocator, struct net_buf *nb) {
+  int ref = net_rbuf_unref(nb);
+  if (nb && !ref)
     slab_obj_free(allocator, nb);
-  }
+  return !ref;
 }
 
 /* ── struct net_pipeline_slot ────────────────────────────────────────── */
@@ -178,7 +184,7 @@ static inline uint32_t net_pipeline_enqueue(struct net_proxy_pipeline *pp,
   }
   uint32_t seq = pp->in++;
   struct net_pipeline_slot *s = &pp->slots[seq & (pp->cap - 1)];
-  memset(s, 0, sizeof(*s));
+  memset(s, 0, sizeof(*s)); // TODO: check if memset is redundant here.
   return seq; /* return sequence number — used as pipeline_idx */
 }
 

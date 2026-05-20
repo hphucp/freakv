@@ -754,20 +754,11 @@ void shard_msg_drain(struct shard_engine *engine, struct shard *shard,
           }
 
           /* ── Normal request path ──────────────────────────────────── */
-          struct net_buf *req_nb = NULL;
-          if (cmd_op == MSG_CMD_MGET_PART || cmd_op == MSG_CMD_DEL_PART)
-            req_nb = msg.u.key_part_req.req_nb;
-          else if (cmd_op != MSG_CMD_DBSIZE)
-            req_nb = msg.u.regular_req.req_nb;
           enum proxy_exec_result exec_rc = proxy_exec(shard, &msg, cur);
 
           shard->cross_shard_received++;
-          if (exec_rc == PROXY_EXEC_DEFERRED) {
-            if (req_nb)
-              net_buf_unref(shard->pool, req_nb);
+          if (exec_rc == PROXY_EXEC_DEFERRED)
             continue;
-          }
-
           shard->ops_completed++;
 
           struct spsc_message reply = {

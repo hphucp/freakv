@@ -214,10 +214,7 @@ static inline void stat_free_real(struct shard_engine *engine,
     slab_obj_free(shard->pool, b);
     b = next;
   }
-  if (stat->coord_rbuf_nb) {
-    net_buf_unref(shard->pool, stat->coord_rbuf_nb);
-    stat->coord_rbuf_nb = NULL;
-  }
+  
   slab_obj_free(shard->pool, stat);
 }
 
@@ -959,10 +956,7 @@ static void mset_pending_state_free(struct shard *shard, struct net_conn *c) {
     slab_obj_free(shard->pool, c->pending_arglen);
     c->pending_arglen = NULL;
   }
-  if (c->pending_req_nb) {
-    net_buf_unref(shard->pool, c->pending_req_nb);
-    c->pending_req_nb = NULL;
-  }
+  
   c->pending_argc = 0;
   c->pending_pipeline_idx = 0;
   c->pending_reason = CONN_PENDING_NONE;
@@ -1039,8 +1033,6 @@ static int mset_pending_conn_enqueue(struct reactor *r, struct net_conn *c,
   c->pending_argc = p->argc_got;
   c->pending_argv = argv;
   c->pending_arglen = arglen;
-  if (c->pending_req_nb)
-    net_buf_ref(c->pending_req_nb);
 
   if (!c->pending_queued) {
     c->pending_next = NULL;
@@ -1099,9 +1091,7 @@ void mset_pending_conn_drain(struct reactor *r, uint32_t budget) {
       slab_obj_free(shard->pool, argv);
     if (arglen)
       slab_obj_free(shard->pool, arglen);
-    if (req_nb)
-      net_buf_unref(shard->pool, req_nb);
-
+   
     if (rc < 0 && c->proxy.slots && c->proxy.cap) {
       struct net_pipeline_slot *ps =
           &c->proxy.slots[pipeline_idx & (c->proxy.cap - 1)];
@@ -1146,14 +1136,10 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
   /* Protect the request buffer against Use-After-Free.
    * Local key PREPAREs might trigger stat_free and unref this buffer while
    * we are still looping through its arguments. */
-  if (nb)
-    net_buf_ref(nb);
 
   struct mset_stat *stat =
       (struct mset_stat *)slab_obj_alloc(pool, sizeof(struct mset_stat));
   if (!stat) {
-    if (nb)
-      net_buf_unref(pool, nb);
     r->shard->mset_inflight--;
     return -1;
   }
@@ -1175,8 +1161,6 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
   /* Hold a ref on the input buffer until all PREPARE memcpy's are done.
    * Released in stat_free (via mset_run_fin or mset_on_fin_ack). */
   stat->coord_rbuf_nb = req_nb;
-  if (req_nb)
-    net_buf_ref(req_nb);
 
   /* Store stat in pipeline slot for ACK handler retrieval */
   struct net_pipeline_slot *ps =
@@ -1211,8 +1195,7 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
       /* OOM: stat_free_real walks batch_cleanup_head and frees what's there */
       ps->kv_obj_ptr = NULL;
       stat_free_real(engine, r->shard, stat);
-      if (nb)
-        net_buf_unref(pool, nb);
+      
       return -1;
     }
     b->count = counts[sid];
@@ -1267,10 +1250,6 @@ static int mset_coordinator_dispatch_argv(struct reactor *r, struct net_conn *c,
   if (wake_mask) {
     shard_flush_wakeup(engine, &wake_mask);
   }
-
-  if (nb)
-    net_buf_unref(pool, nb);
-
   return 0;
 }
 
@@ -1401,8 +1380,6 @@ bool mset_check_lock_defer(struct shard *shard, struct spsc_message *msg,
     cmd->req_nb = msg->u.key_part_req.req_nb;
   else
     cmd->req_nb = msg->u.regular_req.req_nb;
-  if (cmd->req_nb)
-    net_buf_ref(cmd->req_nb);
 
   lock_wq_add_regular(lm, le, cmd);
   return true;
