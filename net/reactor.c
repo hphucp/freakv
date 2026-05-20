@@ -602,6 +602,8 @@ static void net_write_handler(struct reactor *r, struct net_conn *c) {
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         /* Socket buffer full: must wait for Master Flush or next EPOLLOUT */
+        if (c->fd >= 0)
+          event_source_want_write(r, &c->event_src);
         net_reactor_mark_dirty_reason(r, c, "socket_eagain");
         return;
       }
