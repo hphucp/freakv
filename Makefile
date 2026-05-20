@@ -40,6 +40,7 @@ LIB_SRCS := \
     mem/mem_pool.c \
     mem/mem_barrier.c \
     memory/slab.c \
+    io/event_source.c \
     net/reactor.c
 
 OBJDIR   := .build

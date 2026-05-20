@@ -2,6 +2,7 @@
 #define CONN_H
 
 #include "../memory/slab.h"
+#include "../io/event_source.h"
 #include "message.h"
 #include "resp.h"
 
@@ -38,6 +39,8 @@ struct net_buf {
   size_t cap;
   uint8_t data[];
 };
+
+struct reactor;
 
 static inline struct net_buf *net_rbuf_alloc(struct slab_allocator *allocator,
                                             size_t cap) {
@@ -117,6 +120,8 @@ struct net_proxy_pipeline {
 
 struct net_conn {
   int fd;
+  event_source_t event_src;
+  struct reactor *reactor;
   enum net_state state;
 
   bool is_shared;      /* true if connection came from shared port */

@@ -46,8 +46,21 @@ static inline uint64_t net_time_ms_get(void) {
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+static void net_conn_on_readable(event_source_t *src);
+static void net_conn_on_writable(event_source_t *src);
+static void net_conn_on_error(event_source_t *src, uint32_t events);
+static void listener_on_readable(event_source_t *src);
+static void listener_on_error(event_source_t *src, uint32_t events);
+static void spsc_queue_on_readable(event_source_t *src);
+static void spsc_queue_on_error(event_source_t *src, uint32_t events);
+static void timer_on_readable(event_source_t *src);
+static void timer_on_error(event_source_t *src, uint32_t events);
+
 static inline void net_reactor_mark_dirty(struct reactor *r,
                                           struct net_conn *c);
+static void net_accept_handler(struct reactor *r);
+static void net_accept_shared_handler(struct reactor *r);
+static void reactor_handle_timer(struct reactor *r);
 
 
 static struct net_conn *net_conn_alloc(struct reactor *r) {
@@ -57,6 +70,7 @@ static struct net_conn *net_conn_alloc(struct reactor *r) {
     return NULL;
   memset(c, 0, sizeof(struct net_conn));
   c->fd = -1;
+  c->reactor = r;
   c->state = CONN_ALIVE;
   c->generation = ++r->conn_generation;
   c->next = c->prev = NULL;
@@ -149,7 +163,7 @@ static inline void net_reactor_mark_dead(struct reactor *r,
 
   /* Close FD immediately if it's still open */
   if (c->fd >= 0) {
-    epoll_ctl(r->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+    event_source_remove_from_epoll(r, &c->event_src);
     close(c->fd);
     c->fd = -1;
   }
@@ -163,8 +177,7 @@ static inline void net_reactor_mark_dead(struct reactor *r,
 }
 
 static void net_conn_write_done(struct reactor *r, struct net_conn *c) {
-  struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.ptr = c};
-  epoll_ctl(r->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+  event_source_drop_write(r, &c->event_src);
   c->wbuf_sent = 0;
   c->wbuf_len = 0;
 }
@@ -184,7 +197,7 @@ static void net_conn_try_free(struct reactor *r, struct net_conn *c) {
 
   /* Safe to destroy */
   if (c->fd >= 0) {
-    epoll_ctl(r->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+    event_source_remove_from_epoll(r, &c->event_src);
     close(c->fd);
     c->fd = -1;
   }
@@ -476,6 +489,82 @@ static void net_pipeline_try_flush(struct reactor *r, struct net_conn *c);
 static void net_reactor_proxy_reply_callback(void *ctx,
                                              const struct spsc_message *msg);
 
+static void net_conn_on_readable(event_source_t *src) {
+  struct net_conn *c = container_of(src, struct net_conn, event_src);
+  if (c->reactor && c->state != CONN_DEAD)
+    net_read_handler(c->reactor, c);
+}
+
+static void net_conn_on_writable(event_source_t *src) {
+  struct net_conn *c = container_of(src, struct net_conn, event_src);
+  if (c->reactor && c->state != CONN_DEAD)
+    net_write_handler(c->reactor, c);
+}
+
+static void net_conn_on_error(event_source_t *src, uint32_t events) {
+  struct net_conn *c = container_of(src, struct net_conn, event_src);
+  if (!c->reactor)
+    return;
+  if (c->state == CONN_DEAD)
+    return;
+  if (events & (EPOLLERR | EPOLLHUP))
+    net_reactor_mark_dead(c->reactor, c);
+  else if (events & EPOLLRDHUP)
+    net_conn_mark_closing(c->reactor, c);
+}
+
+static void listener_on_readable(event_source_t *src) {
+  reactor_listener_source_t *listener =
+      container_of(src, reactor_listener_source_t, event_src);
+  if (!listener->reactor)
+    return;
+  if (listener->shared)
+    net_accept_shared_handler(listener->reactor);
+  else
+    net_accept_handler(listener->reactor);
+}
+
+static void listener_on_error(event_source_t *src, uint32_t events) {
+  reactor_listener_source_t *listener =
+      container_of(src, reactor_listener_source_t, event_src);
+  (void)listener;
+  (void)events;
+}
+
+static void spsc_queue_on_readable(event_source_t *src) {
+  reactor_spsc_source_t *spsc =
+      container_of(src, reactor_spsc_source_t, event_src);
+  uint64_t cnt;
+  if (read(spsc->fd, &cnt, sizeof(cnt)) < 0) {
+  }
+  if (!spsc->reactor)
+    return;
+  shard_msg_drain(spsc->reactor->engine, spsc->reactor->shard,
+                  net_reactor_proxy_reply_callback, spsc->reactor);
+  mset_pending_conn_drain(spsc->reactor, 8);
+}
+
+static void spsc_queue_on_error(event_source_t *src, uint32_t events) {
+  reactor_spsc_source_t *spsc =
+      container_of(src, reactor_spsc_source_t, event_src);
+  (void)spsc;
+  (void)events;
+}
+
+static void timer_on_readable(event_source_t *src) {
+  reactor_timer_source_t *timer =
+      container_of(src, reactor_timer_source_t, event_src);
+  if (timer->reactor)
+    reactor_handle_timer(timer->reactor);
+}
+
+static void timer_on_error(event_source_t *src, uint32_t events) {
+  reactor_timer_source_t *timer =
+      container_of(src, reactor_timer_source_t, event_src);
+  (void)timer;
+  (void)events;
+}
+
 static void net_reactor_mark_conn_dirty_callback(void *ctx, struct net_conn *c,
                                                  const char *reason) {
   struct reactor *r = (struct reactor *)ctx;
@@ -576,10 +665,11 @@ static void net_accept_handler(struct reactor *r) {
       continue;
     }
     c->fd = cfd;
+    event_source_init(&c->event_src, cfd, EPOLLIN | EPOLLET | EPOLLRDHUP,
+                      net_conn_on_readable, net_conn_on_writable,
+                      net_conn_on_error);
     c->is_shared = false;
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLET | EPOLLRDHUP,
-                             .data.ptr = c};
-    if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0)
+    if (event_source_add_to_epoll(r, &c->event_src) < 0)
       net_reactor_mark_dead(r, c);
   }
 }
@@ -604,10 +694,11 @@ static void net_accept_shared_handler(struct reactor *r) {
       continue;
     }
     c->fd = cfd;
+    event_source_init(&c->event_src, cfd, EPOLLIN | EPOLLET | EPOLLRDHUP,
+                      net_conn_on_readable, net_conn_on_writable,
+                      net_conn_on_error);
     c->is_shared = true;
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLET | EPOLLRDHUP,
-                             .data.ptr = c};
-    if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0)
+    if (event_source_add_to_epoll(r, &c->event_src) < 0)
       net_reactor_mark_dead(r, c);
   }
 }
@@ -745,36 +836,48 @@ int net_reactor_init(struct reactor *r, struct shard_engine *engine,
   r->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   if (r->wake_fd < 0)
     goto fail;
-  struct epoll_event ev;
-  memset(&ev, 0, sizeof(ev));
-  ev.events = EPOLLIN | EPOLLET;
-
-  ev.data.u64 = EV_PACK(EV_TYPE_WAKE, r->wake_fd);
-  if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, r->wake_fd, &ev) < 0)
+  r->spsc_source.fd = r->wake_fd;
+  r->spsc_source.reactor = r;
+  event_source_init(&r->spsc_source.event_src, r->wake_fd, EPOLLIN | EPOLLET,
+                    spsc_queue_on_readable, NULL, spsc_queue_on_error);
+  if (event_source_add_to_epoll(r, &r->spsc_source.event_src) < 0)
     goto fail;
 
   r->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (r->timer_fd < 0)
     goto fail;
+  r->timer_source.fd = r->timer_fd;
+  r->timer_source.reactor = r;
+  event_source_init(&r->timer_source.event_src, r->timer_fd, EPOLLIN | EPOLLET,
+                    timer_on_readable, NULL, timer_on_error);
   struct itimerspec its = {.it_interval = {0, EXPIRY_INTERVAL_MS * 1000000},
                            .it_value = {0, EXPIRY_INTERVAL_MS * 1000000}};
   timerfd_settime(r->timer_fd, 0, &its, NULL);
-  ev.data.u64 = EV_PACK(EV_TYPE_TIMER, r->timer_fd);
-  if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, r->timer_fd, &ev) < 0)
+  if (event_source_add_to_epoll(r, &r->timer_source.event_src) < 0)
     goto fail;
 
   r->listen_fd = net_listen_socket_create(shard_port, false);
   if (r->listen_fd < 0)
     goto fail;
-  ev.data.u64 = EV_PACK(EV_TYPE_LISTEN, r->listen_fd);
-  if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, r->listen_fd, &ev) < 0)
+  r->listen_source.fd = r->listen_fd;
+  r->listen_source.shared = false;
+  r->listen_source.reactor = r;
+  event_source_init(&r->listen_source.event_src, r->listen_fd,
+                    EPOLLIN | EPOLLET, listener_on_readable, NULL,
+                    listener_on_error);
+  if (event_source_add_to_epoll(r, &r->listen_source.event_src) < 0)
     goto fail;
 
   r->shared_listen_fd = net_listen_socket_create(base_port, true);
   if (r->shared_listen_fd < 0)
     goto fail;
-  ev.data.u64 = EV_PACK(EV_TYPE_SHARED, r->shared_listen_fd);
-  if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, r->shared_listen_fd, &ev) < 0)
+  r->shared_listen_source.fd = r->shared_listen_fd;
+  r->shared_listen_source.shared = true;
+  r->shared_listen_source.reactor = r;
+  event_source_init(&r->shared_listen_source.event_src, r->shared_listen_fd,
+                    EPOLLIN | EPOLLET, listener_on_readable, NULL,
+                    listener_on_error);
+  if (event_source_add_to_epoll(r, &r->shared_listen_source.event_src) < 0)
     goto fail;
 
   /* Register wake_fd in engine for cross-shard messaging */
@@ -809,65 +912,28 @@ static void reactor_handle_timer(struct reactor *r) {
 void net_reactor_run(struct reactor *r) {
   struct epoll_event events[MAX_EVENTS];
   while (r->shard->running) {
-    /* 1. Sync cross-shard replies into pipeline slots */
-    shard_msg_drain(r->engine, r->shard, net_reactor_proxy_reply_callback, r);
-    mset_pending_conn_drain(r, 8);
-
-    /* 2. Wait for network events */
     int nev = epoll_wait(r->epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
 
     for (int i = 0; i < nev; i++) {
       struct epoll_event *ev = &events[i];
+      event_source_t *src = (event_source_t *)ev->data.ptr;
 
-      if (ev->data.u64 & EV_MARK_SPECIAL) {
-        uint32_t type = EV_GET_TYPE(ev->data.u64);
-        if (type == EV_TYPE_LISTEN) {
-          net_accept_handler(r);
-          continue;
-        }
-        if (type == EV_TYPE_SHARED) {
-          net_accept_shared_handler(r);
-          continue;
-        }
-        if (type == EV_TYPE_TIMER) {
-          reactor_handle_timer(r);
-          continue;
-        }
-        if (type == EV_TYPE_WAKE) {
-          uint64_t cnt;
-          if (read(r->wake_fd, &cnt, sizeof(cnt)) < 0) {
-          }
-          continue;
-        }
+      if (!src)
+        continue;
+
+      if ((ev->events & (EPOLLERR | EPOLLHUP)) && src->on_error) {
+        src->on_error(src, ev->events);
         continue;
       }
 
-      struct net_conn *c = (struct net_conn *)ev->data.ptr;
-      if (!c || c->state == CONN_DEAD)
-        continue;
+      if ((ev->events & EPOLLIN) && src->on_readable)
+        src->on_readable(src);
 
-      /* PRIORITY 1: Hard Errors / Hangup (FD gone, cannot write) */
-      if (ev->events & (EPOLLERR | EPOLLHUP)) {
-        net_reactor_mark_dead(r, c);
-        continue;
-      }
+      if ((ev->events & EPOLLRDHUP) && src->on_error)
+        src->on_error(src, ev->events);
 
-      /* PRIORITY 2: Data available to read */
-      if (ev->events & EPOLLIN) {
-        net_read_handler(r, c);
-        if (c->state == CONN_DEAD)
-          continue;
-      }
-
-      /* PRIORITY 3: Client initiated graceful close (EOF) */
-      if (ev->events & EPOLLRDHUP) {
-        net_conn_mark_closing(r, c);
-      }
-
-      /* PRIORITY 4: Socket buffer space available for write */
-      if (ev->events & EPOLLOUT) {
-        net_write_handler(r, c);
-      }
+      if ((ev->events & EPOLLOUT) && src->on_writable)
+        src->on_writable(src);
     }
 
     /* 3. Master Flush — dynamically drain all dirty connections */
